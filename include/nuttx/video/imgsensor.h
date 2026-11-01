@@ -80,6 +80,9 @@
 #define IMGSENSOR_ID_3A_STATUS            V4L2_CID_3A_STATUS
 #define IMGSENSOR_ID_FLASH_LED_MODE       V4L2_CID_FLASH_LED_MODE
 #define IMGSENSOR_ID_JPEG_QUALITY         V4L2_CID_JPEG_COMPRESSION_QUALITY
+#define IMGSENSOR_ID_ANALOGUE_GAIN        V4L2_CID_ANALOGUE_GAIN
+#define IMGSENSOR_ID_TEST_PATTERN         V4L2_CID_TEST_PATTERN
+#define IMGSENSOR_ID_BLACK_LEVEL          V4L2_CID_BLACK_LEVEL
 #define IMGSENSOR_ID_CLIP_VIDEO           (0xFFFF0000)
 #define IMGSENSOR_ID_CLIP_STILL           (0xFFFF0001)
 
@@ -130,6 +133,12 @@
 #define IMGSENSOR_PIX_FMT_Z16              (11)
 #define IMGSENSOR_PIX_FMT_SRGGB10P         (12)
 
+/* imgsensor_mipi_csi_cfg_t.line_sync: source of the receiver line timing */
+
+#define IMGSENSOR_LINE_SYNC_NONE   0 /* Receiver regenerates it (nominal) */
+#define IMGSENSOR_LINE_SYNC_LS     1 /* Sensor's LS/LE short packets      */
+#define IMGSENSOR_LINE_SYNC_VIDEO  2 /* Start of each video long packet   */
+
 /* Method access helper macros */
 
 #define IMGSENSOR_IS_AVAILABLE(s) \
@@ -158,6 +167,11 @@
   ((s)->ops->get_value ? (s)->ops->get_value(s, i, l, v) : -ENOTTY)
 #define IMGSENSOR_SET_VALUE(s, i, l, v) \
   ((s)->ops->set_value ? (s)->ops->set_value(s, i, l, v) : -ENOTTY)
+#ifdef CONFIG_VIDEO_MIPI_CSI
+#define IMGSENSOR_GET_MIPI_CSI_CONFIG(s, f, i, c) \
+  ((s)->ops->get_mipi_csi_config ? \
+   (s)->ops->get_mipi_csi_config(s, f, i, c) : -ENOTTY)
+#endif
 
 /****************************************************************************
  * Public Types
@@ -275,6 +289,27 @@ typedef enum imgsensor_stream_type_e
   IMGSENSOR_STREAM_TYPE_STILL = 1,
 } imgsensor_stream_type_t;
 
+#ifdef CONFIG_VIDEO_MIPI_CSI
+
+/* Optional MIPI CSI-2 bus configuration for the negotiated format.
+ * Timing is in CSI-2 output line periods of
+ * line_length_pck / vt_pix_clk_hz seconds.
+ */
+
+typedef struct imgsensor_mipi_csi_cfg_s
+{
+  uint32_t link_mbps_per_lane; /* HS line rate per data lane, Mbps    */
+  uint32_t line_length_pck;    /* Line period in vt_pix_clk cycles (0 = n/a) */
+  uint32_t frame_length_lines; /* Frame period in line periods (0 = n/a) */
+  uint32_t vt_pix_clk_hz;      /* Clock of line_length_pck, Hz (0 = n/a) */
+  uint8_t  n_lanes;            /* MIPI CSI-2 data lane count (1..4)   */
+  uint8_t  data_type;          /* MIPI CSI-2 DT (e.g. 0x2b = RAW10)   */
+  uint8_t  pre_active_lines;   /* Line periods from FS to first image line */
+  uint8_t  line_sync;          /* IMGSENSOR_LINE_SYNC_*               */
+} imgsensor_mipi_csi_cfg_t;
+
+#endif /* CONFIG_VIDEO_MIPI_CSI */
+
 /* Structure for validate_frame_setting() and start_capture() */
 
 typedef struct imgsensor_format_s
@@ -289,6 +324,19 @@ typedef struct imgsensor_interval_s
   uint32_t numerator;
   uint32_t denominator;
 } imgsensor_interval_t;
+
+#ifdef CONFIG_VIDEO_MIPI_CSI
+
+typedef struct imgsensor_mipi_csi_mode_s
+{
+  uint32_t pixelformat;  /* V4L2 fourcc delivered by the receiver; the
+                          * wire format is cfg.data_type */
+  uint16_t width;
+  uint16_t height;
+  imgsensor_interval_t interval;
+} imgsensor_mipi_csi_mode_t;
+
+#endif /* CONFIG_VIDEO_MIPI_CSI */
 
 /* Structure for get_supported_value() */
 
@@ -390,6 +438,16 @@ struct imgsensor_ops_s
   CODE int  (*set_value)(FAR struct imgsensor_s *sensor,
                          uint32_t id, uint32_t size,
                          imgsensor_value_t value);
+#ifdef CONFIG_VIDEO_MIPI_CSI
+  /* Optional: CSI-2 link parameters of a mode accepted by
+   * validate_frame_setting(), queried by the data driver.
+   */
+
+  CODE int  (*get_mipi_csi_config)(FAR struct imgsensor_s *sensor,
+                                   FAR const imgsensor_format_t *format,
+                                   FAR const imgsensor_interval_t *interval,
+                                   FAR imgsensor_mipi_csi_cfg_t *config);
+#endif
 };
 
 /* Image sensor private data.  This structure only defines the initial fields
@@ -406,6 +464,10 @@ struct imgsensor_s
   FAR const struct v4l2_frmsizeenum *frmsizes;
   size_t frmintervals_num;
   FAR const struct v4l2_frmivalenum *frmintervals;
+#ifdef CONFIG_VIDEO_MIPI_CSI
+  size_t mipi_csi_modes_num;
+  FAR const imgsensor_mipi_csi_mode_t *mipi_csi_modes;
+#endif
 };
 
 #ifdef __cplusplus
