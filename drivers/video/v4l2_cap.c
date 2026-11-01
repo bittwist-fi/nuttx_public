@@ -812,13 +812,28 @@ estimate_next_capture_state(FAR capture_mng_t *cmng,
     }
 }
 
-static void convert_to_imgdatafmt(FAR video_format_t *video,
-                                  FAR imgdata_format_t *data)
+static int convert_to_imgdatafmt(FAR video_format_t *video,
+                                 FAR imgdata_format_t *data,
+                                 FAR const struct imgsensor_s *imgsensor)
 {
   ASSERT(video && data);
 
   data->width  = video->width;
   data->height = video->height;
+#ifdef CONFIG_VIDEO_MIPI_CSI
+  DEBUGASSERT(imgsensor != NULL);
+
+  if (imgsensor->mipi_csi_modes != NULL)
+    {
+      /* The receiver gets the mode fourcc as is */
+
+      data->pixelformat = video->pixelformat;
+      return OK;
+    }
+#else
+  (void)imgsensor;
+#endif
+
   switch (video->pixelformat)
     {
       case V4L2_PIX_FMT_NV12:
@@ -861,19 +876,33 @@ static void convert_to_imgdatafmt(FAR video_format_t *video,
         data->pixelformat = IMGDATA_PIX_FMT_ENTROPY;
         break;
 
-      default: /* V4L2_PIX_FMT_JPEG_WITH_SUBIMG */
+      default:
         data->pixelformat = IMGDATA_PIX_FMT_JPEG_WITH_SUBIMG;
         break;
     }
+
+  return OK;
 }
 
 static void convert_to_imgsensorfmt(FAR video_format_t *video,
-                                    FAR imgsensor_format_t *sensor)
+                                    FAR imgsensor_format_t *sensor,
+                                    FAR const struct imgsensor_s *imgsensor)
 {
   ASSERT(video && sensor);
 
   sensor->width  = video->width;
   sensor->height = video->height;
+
+#ifdef CONFIG_VIDEO_MIPI_CSI
+  if (imgsensor->mipi_csi_modes != NULL)
+    {
+      /* MIPI CSI cameras use fourcc formats directly */
+
+      sensor->pixelformat = video->pixelformat;
+      return;
+    }
+#endif
+
   switch (video->pixelformat)
     {
       case V4L2_PIX_FMT_NV12:
@@ -1026,14 +1055,44 @@ static int start_capture(FAR struct capture_mng_s *cmng,
 
   get_clipped_format(nr_fmt, fmt, clip, c_fmt);
 
-  convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_MAIN], &df[IMGDATA_FMT_MAIN]);
-  convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_SUB], &df[IMGDATA_FMT_SUB]);
   convert_to_imgdatainterval(interval, &di);
-  convert_to_imgsensorfmt(&fmt[CAPTURE_FMT_MAIN], &sf[IMGSENSOR_FMT_MAIN]);
-  convert_to_imgsensorfmt(&fmt[CAPTURE_FMT_SUB], &sf[IMGSENSOR_FMT_SUB]);
+  convert_to_imgsensorfmt(&fmt[CAPTURE_FMT_MAIN], &sf[IMGSENSOR_FMT_MAIN],
+                          cmng->imgsensor);
+  convert_to_imgsensorfmt(&fmt[CAPTURE_FMT_SUB], &sf[IMGSENSOR_FMT_SUB],
+                          cmng->imgsensor);
   convert_to_imgsensorinterval(interval, &si);
 
-  ret = IMGDATA_SET_BUF(cmng->imgdata,
+#ifdef CONFIG_VIDEO_MIPI_CSI
+  ret = IMGSENSOR_VALIDATE_FRAME_SETTING(cmng->imgsensor,
+          type == V4L2_BUF_TYPE_VIDEO_CAPTURE ?
+          IMGSENSOR_STREAM_TYPE_VIDEO : IMGSENSOR_STREAM_TYPE_STILL,
+          nr_fmt, sf, &si);
+  if (ret != OK)
+    {
+      return ret;
+    }
+#endif
+
+  ret = convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_MAIN],
+                              &df[IMGDATA_FMT_MAIN],
+                              cmng->imgsensor);
+  if (ret != OK)
+    {
+      return ret;
+    }
+
+  if (nr_fmt > 1)
+    {
+      ret = convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_SUB],
+                                  &df[IMGDATA_FMT_SUB],
+                                  cmng->imgsensor);
+      if (ret != OK)
+        {
+          return ret;
+        }
+    }
+
+  IMGDATA_SET_BUF(cmng->imgdata,
      nr_fmt, df, (FAR uint8_t *)bufaddr, bufsize);
   if (ret < 0 && ret != -ENOTTY)
     {
@@ -1552,11 +1611,11 @@ static int validate_frame_setting(FAR capture_mng_t *cmng,
 
   get_clipped_format(nr_fmt, vfmt, clip, c_fmt);
 
-  convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_MAIN], &df[IMGDATA_FMT_MAIN]);
-  convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_SUB], &df[IMGDATA_FMT_SUB]);
   convert_to_imgdatainterval(interval, &di);
-  convert_to_imgsensorfmt(&vfmt[CAPTURE_FMT_MAIN], &sf[IMGSENSOR_FMT_MAIN]);
-  convert_to_imgsensorfmt(&vfmt[CAPTURE_FMT_SUB], &sf[IMGSENSOR_FMT_SUB]);
+  convert_to_imgsensorfmt(&vfmt[CAPTURE_FMT_MAIN], &sf[IMGSENSOR_FMT_MAIN],
+                          cmng->imgsensor);
+  convert_to_imgsensorfmt(&vfmt[CAPTURE_FMT_SUB], &sf[IMGSENSOR_FMT_SUB],
+                          cmng->imgsensor);
   convert_to_imgsensorinterval(interval, &si);
 
   ret = IMGSENSOR_VALIDATE_FRAME_SETTING(cmng->imgsensor,
@@ -1566,6 +1625,25 @@ static int validate_frame_setting(FAR capture_mng_t *cmng,
   if (ret != OK)
     {
       return ret;
+    }
+
+  ret = convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_MAIN],
+                              &df[IMGDATA_FMT_MAIN],
+                              cmng->imgsensor);
+  if (ret != OK)
+    {
+      return ret;
+    }
+
+  if (nr_fmt > 1)
+    {
+      ret = convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_SUB],
+                                  &df[IMGDATA_FMT_SUB],
+                                  cmng->imgsensor);
+      if (ret != OK)
+        {
+          return ret;
+        }
     }
 
   return IMGDATA_VALIDATE_FRAME_SETTING(cmng->imgdata, nr_fmt, df, &di);
@@ -2335,9 +2413,9 @@ set_next_buf:
                              c_fmt);
 
           convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_MAIN],
-                                &df[IMGDATA_FMT_MAIN]);
+                                &df[IMGDATA_FMT_MAIN], cmng->imgsensor);
           convert_to_imgdatafmt(&c_fmt[CAPTURE_FMT_SUB],
-                                &df[IMGDATA_FMT_SUB]);
+                                &df[IMGDATA_FMT_SUB], cmng->imgsensor);
 
           ret = IMGDATA_SET_BUF(cmng->imgdata,
             type_inf->nr_fmt,
@@ -3004,6 +3082,17 @@ static int capture_try_fmt(FAR struct file *filep,
         break;
 
       default:
+#ifdef CONFIG_VIDEO_MIPI_CSI
+        if (cmng->imgsensor->mipi_csi_modes != NULL)
+          {
+            nr_fmt = 1;
+            vf[CAPTURE_FMT_MAIN].width       = fmt->fmt.pix.width;
+            vf[CAPTURE_FMT_MAIN].height      = fmt->fmt.pix.height;
+            vf[CAPTURE_FMT_MAIN].pixelformat = fmt->fmt.pix.pixelformat;
+            break;
+          }
+#endif
+
         return -EINVAL;
     }
 
