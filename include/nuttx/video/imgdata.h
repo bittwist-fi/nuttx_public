@@ -85,6 +85,9 @@ typedef struct imgdata_format_s
   uint16_t width;
   uint16_t height;
   uint32_t pixelformat;
+#ifdef CONFIG_VIDEO_MIPI_CSI
+  FAR const struct imgsensor_mipi_csi_cfg_s *mipi_csi;
+#endif
 } imgdata_format_t;
 
 typedef struct imgdata_interval_s

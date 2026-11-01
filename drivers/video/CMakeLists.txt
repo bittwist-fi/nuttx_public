@@ -32,6 +32,9 @@ if(CONFIG_DRIVERS_VIDEO)
 
   if(CONFIG_VIDEO_STREAM)
     list(APPEND SRCS v4l2_core.c video_framebuff.c v4l2_cap.c v4l2_m2m.c)
+    if(CONFIG_VIDEO_MIPI_CSI)
+      list(APPEND SRCS csi_sensor.c)
+    endif()
   endif()
 
   # These video drivers depend on I2C support

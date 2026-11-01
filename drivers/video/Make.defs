@@ -30,6 +30,10 @@ endif
 
 ifeq ($(CONFIG_VIDEO_STREAM),y)
   CSRCS += v4l2_core.c video_framebuff.c v4l2_cap.c v4l2_m2m.c
+
+ifeq ($(CONFIG_VIDEO_MIPI_CSI),y)
+  CSRCS += csi_sensor.c
+endif
 endif
 
 ifeq ($(CONFIG_VIDEO_FB_SPLASHSCREEN),y)
