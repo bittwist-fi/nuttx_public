@@ -1,0 +1,49 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config VIDEO_IMX219
+	bool "Sony IMX219 image sensor"
+	default n
+	depends on VIDEO_MIPI_CSI
+	select I2C
+	---help---
+		Enable the Sony IMX219 8-Mpx CMOS MIPI CSI-2 image sensor driver.
+		The sensor is registered as a V4L2 imgsensor and controlled
+		through V4L2 (format, frame interval, exposure, analog gain and
+		test pattern).
+
+		A MIPI CSI-2 receiver (imgdata) is required to receive pixel
+		data from the sensor.
+
+if VIDEO_IMX219
+
+choice
+	prompt "IMX219 default startup mode"
+	default VIDEO_IMX219_DEFMODE_1080P
+	---help---
+		Sensor mode loaded at initialization, before a V4L2 client
+		selects a format. All modes are RAW10 on 2 MIPI CSI-2 lanes.
+
+config VIDEO_IMX219_DEFMODE_1080P
+	bool "1920 x 1080 (crop, no binning)"
+	---help---
+		Full-resolution 1080p centre crop of the pixel array. Highest
+		spatial detail; smallest field-of-view.
+
+config VIDEO_IMX219_DEFMODE_1640X1232
+	bool "1640 x 1232 (2x2 binning, full FoV)"
+	---help---
+		Full-array 2x2 binned mode. Full field-of-view, moderate
+		resolution, ~4x sensitivity vs full-res crop.
+
+config VIDEO_IMX219_DEFMODE_VGA
+	bool "640 x 480 VGA (2x2 binning, centre crop)"
+	---help---
+		Low-bandwidth VGA mode. Useful for optical flow, quick
+		prototyping and bring-up.
+
+endchoice
+
+endif # VIDEO_IMX219
