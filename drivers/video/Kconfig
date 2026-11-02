@@ -568,5 +568,6 @@ endif # GOLDFISH_CAMERA
 
 source "drivers/video/vnc/Kconfig"
 source "drivers/video/mipidsi/Kconfig"
+source "drivers/video/imx219/Kconfig"
 
 endif # DRIVERS_VIDEO

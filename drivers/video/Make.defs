@@ -98,6 +98,7 @@ endif
 
 include video/vnc/Make.defs
 include video/mipidsi/Make.defs
+include video/imx219/Make.defs
 
 # Include video driver build support
 
