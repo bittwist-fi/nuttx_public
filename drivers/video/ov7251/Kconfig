@@ -1,0 +1,21 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config VIDEO_OV7251
+        bool "OmniVision OV7251 monochrome image sensor"
+        default n
+        depends on VIDEO_MIPI_CSI
+        select I2C
+        ---help---
+                Enable the OmniVision OV7251 VGA global-shutter monochrome
+                MIPI CSI-2 image sensor driver (640x480, RAW10, 1 data lane,
+                EXTCLK 24 MHz).
+
+                The sensor is registered as a V4L2 imgsensor and controlled
+                through V4L2 (format, frame interval, exposure, analog gain and
+                test pattern).
+
+                A MIPI CSI-2 receiver (imgdata) is required to receive pixel
+                data from the sensor.
