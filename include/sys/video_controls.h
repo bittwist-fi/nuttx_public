@@ -245,7 +245,27 @@ enum v4l2_scene_mode
 
 #define V4L2_CID_EXPOSURE_METERING_SPOT_POSITION CAMERA_CID(22)
 
-#define V4L2_CID_CAMERA_LAST          V4L2_CID_EXPOSURE_METERING_SPOT_POSITION
+/* Sensor analogue-gain.
+ * Expressed as a Q16 gain factor (>= 0x10000 = 1.0x); the sensor
+ * driver maps this to its own analog-gain register.
+ */
+
+#define V4L2_CID_ANALOGUE_GAIN        CAMERA_CID(23)
+
+/* Sensor test pattern generator selection. The set of supported
+ * pattern indices is sensor-specific; consult the sensor driver
+ * header (e.g. enum imx219_test_pattern_e) for the valid values.
+ */
+
+#define V4L2_CID_TEST_PATTERN         CAMERA_CID(24)
+
+/* Sensor black level in output LSBs at the current bit depth.
+ * Read-only; query it with VIDIOC_QUERYCTRL.
+ */
+
+#define V4L2_CID_BLACK_LEVEL          CAMERA_CID(25)
+
+#define V4L2_CID_CAMERA_LAST          V4L2_CID_BLACK_LEVEL 
 
 /* Flash and privacy (indicator) light controls */
 

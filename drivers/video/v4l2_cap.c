@@ -605,6 +605,18 @@ static const capture_parameter_name_t g_capture_parameter_name[] =
 
     {
       IMGSENSOR_ID_JPEG_QUALITY,         "JPEG compression quality"
+    },
+
+    {
+      IMGSENSOR_ID_ANALOGUE_GAIN,        "Analogue gain(Q16)"
+    },
+
+    {
+      IMGSENSOR_ID_TEST_PATTERN,         "Test pattern"
+    },
+
+    {
+      IMGSENSOR_ID_BLACK_LEVEL,          "Black level"
     }
 };
 
