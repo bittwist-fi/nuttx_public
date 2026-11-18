@@ -46,7 +46,7 @@ extern "C"
  *
  * Description:
  *   Create an IMX335 image sensor instance.  The sensor must be powered
- *   and out of reset; it is probed when the capture driver is registered.
+ *   and out of reset; NULL is returned if it does not respond.
  *
  * Input Parameters:
  *   i2c  - I2C bus the sensor is attached to (address 0x1a)

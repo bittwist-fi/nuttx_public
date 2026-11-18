@@ -526,6 +526,7 @@ config VIDEO_GC0308
 config VIDEO_IMX335
 	bool "IMX335 image sensor"
 	default n
+	depends on VIDEO_MIPI_CSI
 	select I2C
 	---help---
 		Sony IMX335 5 MP image sensor with a 2-lane MIPI CSI-2 RAW10
