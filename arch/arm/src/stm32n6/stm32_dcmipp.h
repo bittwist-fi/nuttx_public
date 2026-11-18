@@ -50,20 +50,15 @@
  * Public Types
  ****************************************************************************/
 
-/* Description of the raw Bayer CSI-2 sensor attached to the DCMIPP and the
- * image signal processing applied in pipe1.  The white balance gains are
- * the initial ones with CONFIG_STM32_DCMIPP_AWB.
+/* Image signal processing applied in pipe1 to the frames of the raw Bayer
+ * CSI-2 sensor attached to the DCMIPP.  The frame sizes, the Bayer order,
+ * the bit depth and the CSI-2 link come from the MIPI CSI modes of the
+ * sensor.  The white balance gains are the initial ones with
+ * CONFIG_STM32_DCMIPP_AWB.
  */
 
 struct stm32_dcmipp_config_s
 {
-  uint16_t width;          /* Sensor frame width in pixels */
-  uint16_t height;         /* Sensor frame height in lines */
-  uint32_t pixelformat;    /* Sensor format, IMGSENSOR_PIX_FMT_xxx */
-  uint8_t  lanes;          /* CSI-2 data lanes (1 or 2) */
-  uint16_t bitrate;        /* CSI-2 bit rate per lane in Mbit/s */
-  uint8_t  bpp;            /* Raw bits per pixel (8, 10, 12 or 14) */
-  uint8_t  bayer;          /* STM32_DCMIPP_BAYER_xxx */
   uint8_t  blacklevel;     /* Black level subtracted (8-bit scale) */
   uint16_t gain[3];        /* R, G, B white balance gains, 128 = 1.0 */
   int16_t  ccm[3][3];      /* Colour correction matrix, 256 = 1.0 */
