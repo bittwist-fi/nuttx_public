@@ -1179,6 +1179,8 @@ config STM32_DCMI
 config STM32_DCMIPP
 	bool "DCMIPP"
 	depends on STM32_HAVE_DCMIPP && VIDEO_STREAM
+	select VIDEO_MIPI_CSI
+	select VIDEO_MIPI_CSI_SCALING
 	---help---
 		Digital camera interface pixel pipeline with the MIPI CSI-2
 		host.  Captures raw Bayer frames from a CSI-2 image sensor and

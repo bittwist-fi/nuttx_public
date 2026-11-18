@@ -59,10 +59,12 @@
 #include <nuttx/cache.h>
 #include <nuttx/clock.h>
 #include <nuttx/irq.h>
+#include <nuttx/kmalloc.h>
 #include <nuttx/mutex.h>
 #include <nuttx/signal.h>
 #include <nuttx/video/video.h>
 #include <nuttx/wqueue.h>
+#include <nuttx/video/csi_sensor.h>
 #include <nuttx/video/imgdata.h>
 #include <nuttx/video/imgsensor.h>
 
@@ -132,7 +134,9 @@ struct stm32_dcmipp_s
 {
   struct imgdata_s data;              /* Must be first */
   struct imgsensor_s isp;             /* Sensor seen by V4L2 */
-  struct v4l2_frmsizeenum frmsizes[3];
+  FAR const char *ispname;
+  FAR imgsensor_mipi_csi_mode_t *ispmodes; /* Sensor frames as RGB565 */
+  FAR struct v4l2_frmsizeenum *frmsizes;
   FAR struct imgsensor_s *sensor;     /* Raw sensor */
   FAR const struct stm32_dcmipp_config_s *config;
   imgdata_capture_t callback;         /* Frame completion callback */
@@ -140,6 +144,10 @@ struct stm32_dcmipp_s
   uintptr_t buf;                      /* Buffer for the next frame or 0 */
   uint32_t framesize;                 /* Bytes in one output frame */
   bool capturing;
+  bool csiup;                         /* CSI-2 host started */
+  uint8_t csilanes;                   /* Link of the started CSI-2 host */
+  uint16_t csirate;
+  uint8_t csibpp;
   bool armed;                         /* Capture requested into buf */
   bool active;                        /* Frame being written into buf */
   bool frameerr;                      /* Error during the active frame */
@@ -193,11 +201,12 @@ static int dcmipp_isp_init(FAR struct imgsensor_s *sensor);
 static int dcmipp_isp_uninit(FAR struct imgsensor_s *sensor);
 static FAR const char *
 dcmipp_isp_get_driver_name(FAR struct imgsensor_s *sensor);
-static int dcmipp_isp_validate_frame_setting(FAR struct imgsensor_s *sensor,
-                                             imgsensor_stream_type_t type,
-                                             uint8_t nr_datafmts,
-                                             FAR imgsensor_format_t *fmts,
-                                             FAR imgsensor_interval_t *ival);
+static int
+dcmipp_isp_validate_frame_setting(FAR struct imgsensor_s *sensor,
+                                  imgsensor_stream_type_t type,
+                                  uint8_t nr_datafmts,
+                                  FAR imgsensor_format_t *fmts,
+                                  FAR imgsensor_interval_t *ival);
 static int dcmipp_isp_start_capture(FAR struct imgsensor_s *sensor,
                                     imgsensor_stream_type_t type,
                                     uint8_t nr_datafmts,
@@ -205,11 +214,9 @@ static int dcmipp_isp_start_capture(FAR struct imgsensor_s *sensor,
                                     FAR imgsensor_interval_t *ival);
 static int dcmipp_isp_stop_capture(FAR struct imgsensor_s *sensor,
                                    imgsensor_stream_type_t type);
-static int dcmipp_isp_get_frame_interval(FAR struct imgsensor_s *sensor,
-                                         imgsensor_stream_type_t type,
-                                         FAR imgsensor_interval_t *ival);
 static int
-dcmipp_isp_get_supported_value(FAR struct imgsensor_s *sensor, uint32_t id,
+dcmipp_isp_get_supported_value(FAR struct imgsensor_s *sensor,
+                               uint32_t id,
                                FAR imgsensor_supported_value_t *val);
 static int dcmipp_isp_get_value(FAR struct imgsensor_s *sensor,
                                 uint32_t id, uint32_t size,
@@ -241,7 +248,6 @@ static const struct imgsensor_ops_s g_dcmipp_isp_ops =
   .validate_frame_setting = dcmipp_isp_validate_frame_setting,
   .start_capture          = dcmipp_isp_start_capture,
   .stop_capture           = dcmipp_isp_stop_capture,
-  .get_frame_interval     = dcmipp_isp_get_frame_interval,
   .get_supported_value    = dcmipp_isp_get_supported_value,
   .get_value              = dcmipp_isp_get_value,
   .set_value              = dcmipp_isp_set_value,
@@ -262,10 +268,6 @@ static struct stm32_dcmipp_s g_dcmipp =
   .data =
     {
       .ops = &g_dcmipp_ops,
-    },
-  .isp =
-    {
-      .ops = &g_dcmipp_isp_ops,
     },
 };
 
@@ -350,7 +352,8 @@ static void dcmipp_setwb(FAR const uint16_t *gain)
  *
  ****************************************************************************/
 
-static void dcmipp_configisp(FAR const struct stm32_dcmipp_config_s *cfg)
+static void dcmipp_configisp(FAR const struct stm32_dcmipp_config_s *cfg,
+                             uint8_t bayer)
 {
   uint32_t regval;
 
@@ -370,14 +373,10 @@ static void dcmipp_configisp(FAR const struct stm32_dcmipp_config_s *cfg)
 
   putreg32(regval, STM32_DCMIPP_P1BLCCR);
 
-  /* White balance gains in the exposure block */
-
-  dcmipp_setwb(cfg->gain);
-
   /* Demosaicing */
 
   putreg32(DCMIPP_P1DMCR_ENABLE |
-           ((uint32_t)cfg->bayer << DCMIPP_P1DMCR_TYPE_SHIFT) |
+           ((uint32_t)bayer << DCMIPP_P1DMCR_TYPE_SHIFT) |
            (DCMIPP_DM_PEAK << DCMIPP_P1DMCR_PEAK_SHIFT) |
            (DCMIPP_DM_LINEV << DCMIPP_P1DMCR_LINEV_SHIFT) |
            (DCMIPP_DM_LINEH << DCMIPP_P1DMCR_LINEH_SHIFT) |
@@ -412,11 +411,11 @@ static void dcmipp_configisp(FAR const struct stm32_dcmipp_config_s *cfg)
  *
  ****************************************************************************/
 
-static void dcmipp_configstats(FAR struct stm32_dcmipp_s *priv)
+static void dcmipp_configstats(FAR struct stm32_dcmipp_s *priv,
+                               uint32_t width, uint32_t height)
 {
-  FAR const struct stm32_dcmipp_config_s *cfg = priv->config;
-  uint32_t width  = cfg->width & ~1;
-  uint32_t height = cfg->height & ~1;
+  width  &= ~1;
+  height &= ~1;
 
   putreg32(0, STM32_DCMIPP_P1STSTR);
   putreg32((width << DCMIPP_P1STSZR_HSIZE_SHIFT) |
@@ -765,11 +764,9 @@ static void dcmipp_autostart(FAR struct stm32_dcmipp_s *priv)
  *
  ****************************************************************************/
 
-static void dcmipp_configscaler(FAR const struct stm32_dcmipp_config_s *cfg,
+static void dcmipp_configscaler(uint32_t inw, uint32_t inh,
                                 uint32_t width, uint32_t height)
 {
-  uint32_t inw = cfg->width;
-  uint32_t inh = cfg->height;
   uint32_t hdec = 0;
   uint32_t vdec = 0;
   uint32_t hratio;
@@ -993,6 +990,202 @@ static int dcmipp_interrupt(int irq, FAR void *context, FAR void *arg)
 }
 
 /****************************************************************************
+ * Name: dcmipp_rawfmt
+ *
+ * Description:
+ *   Bayer order and bits per pixel of a raw sensor fourcc.
+ *
+ ****************************************************************************/
+
+static int dcmipp_rawfmt(uint32_t fourcc, FAR uint8_t *bayer,
+                         FAR uint8_t *bpp)
+{
+  switch (fourcc)
+    {
+      case V4L2_PIX_FMT_SRGGB8:
+      case V4L2_PIX_FMT_SRGGB10:
+      case V4L2_PIX_FMT_SRGGB12:
+        *bayer = STM32_DCMIPP_BAYER_RGGB;
+        break;
+
+      case V4L2_PIX_FMT_SGRBG8:
+      case V4L2_PIX_FMT_SGRBG10:
+      case V4L2_PIX_FMT_SGRBG12:
+        *bayer = STM32_DCMIPP_BAYER_GRBG;
+        break;
+
+      case V4L2_PIX_FMT_SGBRG8:
+      case V4L2_PIX_FMT_SGBRG10:
+      case V4L2_PIX_FMT_SGBRG12:
+        *bayer = STM32_DCMIPP_BAYER_GBRG;
+        break;
+
+      case V4L2_PIX_FMT_SBGGR8:
+      case V4L2_PIX_FMT_SBGGR10:
+      case V4L2_PIX_FMT_SBGGR12:
+        *bayer = STM32_DCMIPP_BAYER_BGGR;
+        break;
+
+      default:
+        return -ENOTSUP;
+    }
+
+  switch (fourcc)
+    {
+      case V4L2_PIX_FMT_SRGGB8:
+      case V4L2_PIX_FMT_SGRBG8:
+      case V4L2_PIX_FMT_SGBRG8:
+      case V4L2_PIX_FMT_SBGGR8:
+        *bpp = 8;
+        break;
+
+      case V4L2_PIX_FMT_SRGGB10:
+      case V4L2_PIX_FMT_SGRBG10:
+      case V4L2_PIX_FMT_SGBRG10:
+      case V4L2_PIX_FMT_SBGGR10:
+        *bpp = 10;
+        break;
+
+      default:
+        *bpp = 12;
+        break;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: dcmipp_findmode
+ *
+ * Description:
+ *   The smallest raw sensor mode that holds an output size and that the
+ *   pipe can scale to it, or NULL.
+ *
+ ****************************************************************************/
+
+static FAR const imgsensor_mipi_csi_mode_t *
+dcmipp_findmode(FAR struct stm32_dcmipp_s *priv, uint32_t width,
+                uint32_t height)
+{
+  FAR const imgsensor_mipi_csi_mode_t *best = NULL;
+  FAR const imgsensor_mipi_csi_mode_t *m;
+  uint8_t bayer;
+  uint8_t bpp;
+  size_t i;
+
+  for (i = 0; i < priv->sensor->mipi_csi_modes_num; i++)
+    {
+      m = &priv->sensor->mipi_csi_modes[i];
+
+      /* At most 1/64 of the sensor size (1/8 decimation and 1/8 downsize) */
+
+      if (dcmipp_rawfmt(m->pixelformat, &bayer, &bpp) == OK &&
+          m->width >= width && m->height >= height &&
+          width * 64 >= m->width && height * 64 >= m->height &&
+          (best == NULL ||
+           (uint32_t)m->width * m->height <
+           (uint32_t)best->width * best->height))
+        {
+          best = m;
+        }
+    }
+
+  return best;
+}
+
+/****************************************************************************
+ * Name: dcmipp_configlink
+ *
+ * Description:
+ *   Set up pipe1 and the CSI-2 host for a raw sensor mode and its link.
+ *
+ ****************************************************************************/
+
+static int dcmipp_configlink(FAR struct stm32_dcmipp_s *priv,
+                             FAR const imgsensor_mipi_csi_mode_t *mode,
+                             FAR const imgsensor_mipi_csi_cfg_t *csi)
+{
+  uint8_t bayer;
+  uint8_t bpp;
+  int ret;
+
+  ret = dcmipp_rawfmt(mode->pixelformat, &bayer, &bpp);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* Pipe1 takes the raw data type of virtual channel 0 */
+
+  putreg32(DCMIPP_P1FSCR_DTIDA(DCMIPP_DT_RAW8 + (bpp - 8) / 2) |
+           DCMIPP_P1FSCR_DTMODE_DTIDA | DCMIPP_P1FSCR_VC(0),
+           STM32_DCMIPP_P1FSCR);
+
+  dcmipp_configisp(priv->config, bayer);
+
+#ifdef HAVE_DCMIPP_AUTO
+  dcmipp_configstats(priv, mode->width, mode->height);
+#endif
+
+  /* Start the D-PHY and virtual channel 0 of the CSI-2 host */
+
+  if (priv->csiup && priv->csilanes == csi->n_lanes &&
+      priv->csirate == csi->link_mbps_per_lane && priv->csibpp == bpp)
+    {
+      return OK;
+    }
+
+  if (priv->csiup)
+    {
+      stm32_csi_stop();
+      priv->csiup = false;
+    }
+
+  ret = stm32_csi_start(csi->n_lanes, csi->link_mbps_per_lane, bpp);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  priv->csiup    = true;
+  priv->csilanes = csi->n_lanes;
+  priv->csirate  = csi->link_mbps_per_lane;
+  priv->csibpp   = bpp;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: dcmipp_getlink
+ *
+ * Description:
+ *   Get the CSI-2 link of a raw sensor mode from the sensor.
+ *
+ ****************************************************************************/
+
+static int dcmipp_getlink(FAR struct stm32_dcmipp_s *priv,
+                          FAR const imgsensor_mipi_csi_mode_t *mode,
+                          FAR const imgdata_interval_t *interval,
+                          FAR imgsensor_mipi_csi_cfg_t *csi)
+{
+  imgsensor_interval_t ival;
+  imgsensor_format_t raw;
+
+  raw.width       = mode->width;
+  raw.height      = mode->height;
+  raw.pixelformat = mode->pixelformat;
+
+  if (interval != NULL)
+    {
+      ival.numerator   = interval->numerator;
+      ival.denominator = interval->denominator;
+    }
+
+  return IMGSENSOR_GET_MIPI_CSI_CONFIG(priv->sensor, &raw,
+                                       interval != NULL ? &ival : NULL,
+                                       csi);
+}
+
+/****************************************************************************
  * Name: dcmipp_init
  ****************************************************************************/
 
@@ -1000,7 +1193,6 @@ static int dcmipp_init(FAR struct imgdata_s *data)
 {
   FAR struct stm32_dcmipp_s *priv = (FAR struct stm32_dcmipp_s *)data;
   FAR const struct stm32_dcmipp_config_s *cfg = priv->config;
-  int ret;
 
   /* Reset the DCMIPP and the CSI-2 host */
 
@@ -1009,32 +1201,25 @@ static int dcmipp_init(FAR struct imgdata_s *data)
   putreg32(RCC_APB5RSTR_DCMIPPRST | RCC_APB5RSTR_CSIRST,
            STM32_RCC_APB5RSTCR);
 
-  /* Serial input, pipe1 takes the raw data type of virtual channel 0 */
+  /* Serial input; the pipe1 data type, the ISP and the CSI-2 link follow
+   * the sensor mode in dcmipp_configlink().
+   */
 
   putreg32(0, STM32_DCMIPP_PRCR);
   putreg32(DCMIPP_CMCR_INSEL, STM32_DCMIPP_CMCR);
-  putreg32(DCMIPP_P1FSCR_DTIDA(DCMIPP_DT_RAW8 + (cfg->bpp - 8) / 2) |
-           DCMIPP_P1FSCR_DTMODE_DTIDA | DCMIPP_P1FSCR_VC(0),
-           STM32_DCMIPP_P1FSCR);
 
-  dcmipp_configisp(cfg);
+  /* White balance gains in the exposure block */
+
+  dcmipp_setwb(cfg->gain);
 
 #ifdef HAVE_DCMIPP_AUTO
-  dcmipp_configstats(priv);
   priv->gain[0] = cfg->gain[0];
   priv->gain[1] = cfg->gain[1];
   priv->gain[2] = cfg->gain[2];
   priv->busy    = false;
 #endif
 
-  /* Start the D-PHY and virtual channel 0 of the CSI-2 host */
-
-  ret = stm32_csi_start(cfg->lanes, cfg->bitrate, cfg->bpp);
-  if (ret < 0)
-    {
-      return ret;
-    }
-
+  priv->csiup     = false;
   priv->capturing = false;
   priv->armed     = false;
   priv->active    = false;
@@ -1050,9 +1235,16 @@ static int dcmipp_init(FAR struct imgdata_s *data)
 
 static int dcmipp_uninit(FAR struct imgdata_s *data)
 {
+  FAR struct stm32_dcmipp_s *priv = (FAR struct stm32_dcmipp_s *)data;
+
   dcmipp_stop_capture(data);
   up_disable_irq(STM32_IRQ_DCMIPP);
-  stm32_csi_stop();
+  if (priv->csiup)
+    {
+      stm32_csi_stop();
+      priv->csiup = false;
+    }
+
   return OK;
 }
 
@@ -1115,7 +1307,8 @@ static int dcmipp_validate_frame_setting(FAR struct imgdata_s *data,
                                          FAR imgdata_interval_t *interval)
 {
   FAR struct stm32_dcmipp_s *priv = (FAR struct stm32_dcmipp_s *)data;
-  FAR const struct stm32_dcmipp_config_s *cfg = priv->config;
+  FAR const imgsensor_mipi_csi_mode_t *mode;
+  imgsensor_mipi_csi_cfg_t csi;
   FAR imgdata_format_t *fmt;
 
   if (nr_datafmts != 1 || datafmts == NULL)
@@ -1124,18 +1317,16 @@ static int dcmipp_validate_frame_setting(FAR struct imgdata_s *data,
     }
 
   fmt = &datafmts[IMGDATA_FMT_MAIN];
-  if (fmt->pixelformat != IMGDATA_PIX_FMT_RGB565)
+  if (fmt->pixelformat != V4L2_PIX_FMT_RGB565)
     {
       return -EINVAL;
     }
 
-  /* The line pitch must be a multiple of 16 bytes; at most 1/64 of the
-   * sensor size (1/8 decimation and 1/8 downsize).
-   */
+  /* The line pitch must be a multiple of 16 bytes */
 
-  if ((fmt->width & 7) != 0 || fmt->width > cfg->width ||
-      fmt->height > cfg->height ||
-      fmt->width * 64 < cfg->width || fmt->height * 64 < cfg->height)
+  mode = (fmt->width & 7) != 0 ? NULL :
+         dcmipp_findmode(priv, fmt->width, fmt->height);
+  if (mode == NULL || dcmipp_getlink(priv, mode, interval, &csi) < 0)
     {
       return -EINVAL;
     }
@@ -1165,6 +1356,8 @@ static int dcmipp_start_capture(FAR struct imgdata_s *data,
 {
   FAR struct stm32_dcmipp_s *priv = (FAR struct stm32_dcmipp_s *)data;
   FAR imgdata_format_t *fmt = &datafmts[IMGDATA_FMT_MAIN];
+  FAR const imgsensor_mipi_csi_mode_t *mode;
+  imgsensor_mipi_csi_cfg_t csi;
   irqstate_t flags;
   int ret;
 
@@ -1187,7 +1380,20 @@ static int dcmipp_start_capture(FAR struct imgdata_s *data,
       dcmipp_disablepipe();
     }
 
-  dcmipp_configscaler(priv->config, fmt->width, fmt->height);
+  mode = dcmipp_findmode(priv, fmt->width, fmt->height);
+  ret  = dcmipp_getlink(priv, mode, interval, &csi);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = dcmipp_configlink(priv, mode, &csi);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  dcmipp_configscaler(mode->width, mode->height, fmt->width, fmt->height);
 
   putreg32(DCMIPP_P1PPCR_FORMAT_RGB565, STM32_DCMIPP_P1PPCR);
   putreg32(fmt->width * 2, STM32_DCMIPP_P1PPM0PR);
@@ -1273,19 +1479,24 @@ static int dcmipp_isp_sensorfmt(FAR struct stm32_dcmipp_s *priv,
                                 FAR const imgsensor_format_t *fmts,
                                 FAR imgsensor_format_t *raw)
 {
-  FAR const struct stm32_dcmipp_config_s *cfg = priv->config;
+  FAR const imgsensor_mipi_csi_mode_t *mode;
 
   if (nr_datafmts != 1 || fmts == NULL ||
-      fmts[IMGSENSOR_FMT_MAIN].pixelformat != IMGSENSOR_PIX_FMT_RGB565 ||
-      fmts[IMGSENSOR_FMT_MAIN].width > cfg->width ||
-      fmts[IMGSENSOR_FMT_MAIN].height > cfg->height)
+      fmts[IMGSENSOR_FMT_MAIN].pixelformat != V4L2_PIX_FMT_RGB565)
     {
       return -EINVAL;
     }
 
-  raw->width       = cfg->width;
-  raw->height      = cfg->height;
-  raw->pixelformat = cfg->pixelformat;
+  mode = dcmipp_findmode(priv, fmts[IMGSENSOR_FMT_MAIN].width,
+                         fmts[IMGSENSOR_FMT_MAIN].height);
+  if (mode == NULL)
+    {
+      return -EINVAL;
+    }
+
+  raw->width       = mode->width;
+  raw->height      = mode->height;
+  raw->pixelformat = mode->pixelformat;
   return OK;
 }
 
@@ -1323,19 +1534,25 @@ static int dcmipp_isp_uninit(FAR struct imgsensor_s *sensor)
 static FAR const char *
 dcmipp_isp_get_driver_name(FAR struct imgsensor_s *sensor)
 {
-  return IMGSENSOR_GET_DRIVER_NAME(g_dcmipp.sensor);
+  return g_dcmipp.ispname;
 }
 
 /****************************************************************************
  * Name: dcmipp_isp_validate_frame_setting
+ *
+ * Description:
+ *   Validate the raw frame with the sensor.
+ *
  ****************************************************************************/
 
-static int dcmipp_isp_validate_frame_setting(FAR struct imgsensor_s *sensor,
-                                             imgsensor_stream_type_t type,
-                                             uint8_t nr_datafmts,
-                                             FAR imgsensor_format_t *fmts,
-                                             FAR imgsensor_interval_t *ival)
+static int
+dcmipp_isp_validate_frame_setting(FAR struct imgsensor_s *sensor,
+                                  imgsensor_stream_type_t type,
+                                  uint8_t nr_datafmts,
+                                  FAR imgsensor_format_t *fmts,
+                                  FAR imgsensor_interval_t *ival)
 {
+  imgsensor_interval_t rawival = *ival;
   imgsensor_format_t raw;
   int ret;
 
@@ -1345,8 +1562,8 @@ static int dcmipp_isp_validate_frame_setting(FAR struct imgsensor_s *sensor,
       return ret;
     }
 
-  return IMGSENSOR_VALIDATE_FRAME_SETTING(g_dcmipp.sensor, type, 1, &raw,
-                                          ival);
+  return IMGSENSOR_VALIDATE_FRAME_SETTING(g_dcmipp.sensor, type, 1,
+                                          &raw, &rawival);
 }
 
 /****************************************************************************
@@ -1382,22 +1599,12 @@ static int dcmipp_isp_stop_capture(FAR struct imgsensor_s *sensor,
 }
 
 /****************************************************************************
- * Name: dcmipp_isp_get_frame_interval
- ****************************************************************************/
-
-static int dcmipp_isp_get_frame_interval(FAR struct imgsensor_s *sensor,
-                                         imgsensor_stream_type_t type,
-                                         FAR imgsensor_interval_t *ival)
-{
-  return IMGSENSOR_GET_FRAME_INTERVAL(g_dcmipp.sensor, type, ival);
-}
-
-/****************************************************************************
  * Name: dcmipp_isp_get_supported_value
  ****************************************************************************/
 
 static int
-dcmipp_isp_get_supported_value(FAR struct imgsensor_s *sensor, uint32_t id,
+dcmipp_isp_get_supported_value(FAR struct imgsensor_s *sensor,
+                               uint32_t id,
                                FAR imgsensor_supported_value_t *val)
 {
   switch (id)
@@ -1489,6 +1696,7 @@ static int dcmipp_isp_set_value(FAR struct imgsensor_s *sensor,
 
       case IMGSENSOR_ID_EXPOSURE_ABSOLUTE:
       case IMGSENSOR_ID_GAIN:
+      case IMGSENSOR_ID_ANALOGUE_GAIN:
         nxmutex_lock(&g_dcmipp.aelock);
         ret = g_dcmipp.aeauto ? -EBUSY :
               IMGSENSOR_SET_VALUE(g_dcmipp.sensor, id, size, value);
@@ -1521,12 +1729,16 @@ int stm32_dcmipp_initialize(FAR const struct stm32_dcmipp_config_s *config,
                             FAR struct imgsensor_s *sensor)
 {
   FAR struct stm32_dcmipp_s *priv = &g_dcmipp;
+  FAR const imgsensor_mipi_csi_mode_t *raw;
+  uint8_t bayer;
+  uint8_t bpp;
+  size_t nmodes;
+  size_t nsizes;
   int ret;
   int i;
+  int j;
 
-  if (config == NULL || sensor == NULL || config->bpp < 8 ||
-      config->bpp > 14 || (config->bpp & 1) != 0 ||
-      config->bayer > STM32_DCMIPP_BAYER_BGGR)
+  if (config == NULL || sensor == NULL || sensor->mipi_csi_modes == NULL)
     {
       return -EINVAL;
     }
@@ -1541,35 +1753,99 @@ int stm32_dcmipp_initialize(FAR const struct stm32_dcmipp_config_s *config,
   priv->awbauto = true;
 #endif
 
-  /* QVGA, VGA and the sensor size; any size accepted by
-   * dcmipp_validate_frame_setting() can be set.
+  /* QVGA, VGA and the sizes of the raw sensor modes; any size accepted by
+   * dcmipp_validate_frame_setting() can be set.  Each raw mode is delivered
+   * as RGB565 and scaled to any smaller size.
    */
 
-  for (i = 0; i < nitems(priv->frmsizes); i++)
+  priv->ispmodes = kmm_zalloc(sensor->mipi_csi_modes_num *
+                              sizeof(*priv->ispmodes));
+  priv->frmsizes = kmm_zalloc((sensor->mipi_csi_modes_num + 2) *
+                              sizeof(*priv->frmsizes));
+  if (priv->ispmodes == NULL || priv->frmsizes == NULL)
     {
-      priv->frmsizes[i].type = V4L2_FRMSIZE_TYPE_DISCRETE;
+      ret = -ENOMEM;
+      goto errout;
     }
 
   priv->frmsizes[0].discrete.width  = VIDEO_HSIZE_QVGA;
   priv->frmsizes[0].discrete.height = VIDEO_VSIZE_QVGA;
   priv->frmsizes[1].discrete.width  = VIDEO_HSIZE_VGA;
   priv->frmsizes[1].discrete.height = VIDEO_VSIZE_VGA;
-  priv->frmsizes[2].discrete.width  = config->width;
-  priv->frmsizes[2].discrete.height = config->height;
+  nsizes = 2;
+  nmodes = 0;
 
-  priv->isp.fmtdescs         = g_dcmipp_fmtdescs;
-  priv->isp.fmtdescs_num     = nitems(g_dcmipp_fmtdescs);
-  priv->isp.frmsizes         = priv->frmsizes;
-  priv->isp.frmsizes_num     = nitems(priv->frmsizes);
-  priv->isp.frmintervals     = sensor->frmintervals;
-  priv->isp.frmintervals_num = sensor->frmintervals_num;
+  for (i = 0; i < sensor->mipi_csi_modes_num; i++)
+    {
+      raw = &sensor->mipi_csi_modes[i];
+      if (dcmipp_rawfmt(raw->pixelformat, &bayer, &bpp) < 0)
+        {
+          continue;
+        }
+
+      priv->ispmodes[nmodes].pixelformat = V4L2_PIX_FMT_RGB565;
+      priv->ispmodes[nmodes].width       = raw->width;
+      priv->ispmodes[nmodes].height      = raw->height;
+      priv->ispmodes[nmodes].interval    = raw->interval;
+      nmodes++;
+
+      for (j = 0; j < nsizes; j++)
+        {
+          if (priv->frmsizes[j].discrete.width == raw->width &&
+              priv->frmsizes[j].discrete.height == raw->height)
+            {
+              break;
+            }
+        }
+
+      if (j == nsizes)
+        {
+          priv->frmsizes[nsizes].discrete.width  = raw->width;
+          priv->frmsizes[nsizes].discrete.height = raw->height;
+          nsizes++;
+        }
+    }
+
+  if (nmodes == 0)
+    {
+      ret = -ENOTSUP;
+      goto errout;
+    }
+
+  for (i = 0; i < nsizes; i++)
+    {
+      priv->frmsizes[i].type = V4L2_FRMSIZE_TYPE_DISCRETE;
+    }
+
+  priv->ispname = IMGSENSOR_GET_DRIVER_NAME(sensor);
+  if (priv->ispname == NULL)
+    {
+      priv->ispname = "DCMIPP";
+    }
+
+  priv->isp.ops                = &g_dcmipp_isp_ops;
+  priv->isp.fmtdescs_num       = nitems(g_dcmipp_fmtdescs);
+  priv->isp.fmtdescs           = g_dcmipp_fmtdescs;
+  priv->isp.frmsizes_num       = nsizes;
+  priv->isp.frmsizes           = priv->frmsizes;
+  priv->isp.frmintervals_num   = sensor->frmintervals_num;
+  priv->isp.frmintervals       = sensor->frmintervals;
+  priv->isp.mipi_csi_modes_num = nmodes;
+  priv->isp.mipi_csi_modes     = priv->ispmodes;
 
   ret = irq_attach(STM32_IRQ_DCMIPP, dcmipp_interrupt, priv);
   if (ret < 0)
     {
-      return ret;
+      goto errout;
     }
 
   imgdata_register(&priv->data);
   return imgsensor_register(&priv->isp);
+
+errout:
+  kmm_free(priv->ispmodes);
+  kmm_free(priv->frmsizes);
+  priv->ispmodes = NULL;
+  priv->frmsizes = NULL;
+  return ret;
 }
