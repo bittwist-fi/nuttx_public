@@ -23,15 +23,21 @@
 /* Sony IMX335 5 MP image sensor, 2-lane MIPI CSI-2, RAW10 RGGB Bayer.
  *
  * The register values come from the Zephyr IMX335 driver
- * (drivers/video/imx335.c, Apache-2.0): all-pixel scan, 2 data lanes,
- * 10 bits, 30 frames per second with the default VMAX of 4500 lines.
+ * (drivers/video/imx335.c, Apache-2.0): 2 data lanes, 10 bits and the
+ * default VMAX of 4500 lines.
  *
- * The sensor only outputs the full 2592x1944 RAW10 frame
- * (V4L2_PIX_FMT_SRGGB10P).  A capture interface with an image signal
- * processor (for example the STM32N6 DCMIPP) demosaics and scales it and
- * registers its own image sensor in front of this one.  There is no
- * automatic exposure in the sensor; the exposure time and the gain can be
- * changed with V4L2_CID_EXPOSURE_ABSOLUTE and V4L2_CID_GAIN.
+ * Two RAW10 (V4L2_PIX_FMT_SRGGB10) modes are offered:
+ *
+ *   1296x972    2/2 binning, 25, 30, 50 or 60 frames per second; the default
+ *   2592x1944   all-pixel scan, 25 or 30 frames per second
+ *
+ * The frame rate is set with the line length (HMAX).  A capture interface
+ * with an image signal processor (for example the STM32N6 DCMIPP)
+ * demosaics and scales the frame and registers its own image sensor in
+ * front of this one.  There is no automatic exposure in the sensor; the
+ * exposure time and the gain can be changed with
+ * V4L2_CID_EXPOSURE_ABSOLUTE and V4L2_CID_GAIN (0.3 dB steps) or
+ * V4L2_CID_ANALOGUE_GAIN (linear Q16.16, analogue range only).
  */
 
 /****************************************************************************
@@ -46,6 +52,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <debug.h>
+#include <string.h>
 
 #include <nuttx/arch.h>
 #include <nuttx/irq.h>
@@ -53,6 +60,7 @@
 #include <nuttx/mutex.h>
 #include <nuttx/signal.h>
 #include <nuttx/i2c/i2c_master.h>
+#include <nuttx/video/csi_sensor.h>
 #include <nuttx/video/imgsensor.h>
 #include <nuttx/video/imx335.h>
 #include <nuttx/video/video.h>
@@ -64,21 +72,45 @@
 #define IMX335_I2C_ADDR          0x1a
 #define IMX335_I2C_FREQ          400000
 
+/* Output sizes of the two modes */
+
 #define IMX335_WIDTH             2592
 #define IMX335_HEIGHT            1944
+#define IMX335_BIN_WIDTH         1296
+#define IMX335_BIN_HEIGHT        972
 
-/* Frame timing: VMAX (reset value, never changed) lines per frame and
- * the HMAX line length for 30 frames per second.
+/* Frame timing: VMAX (reset value, never changed) lines per frame; the
+ * line length HMAX sets the frame rate.  The first shutter line that is
+ * allowed is lower without binning.
  */
 
-#define IMX335_FPS               30
+#define IMX335_FPS_DEFAULT       30
 #define IMX335_VMAX              4500
-#define IMX335_HMAX              0x0226
 #define IMX335_SHR0_MIN          9
+#define IMX335_SHR0_MIN_BIN      17
+
+/* The pixel clock of the line length is 74.25 MHz. */
+
+#define IMX335_VT_PIX_CLK_HZ     74250000
+
+/* Number of line lengths in an exposure time unit of 100 us */
+
+#define IMX335_CLKS_PER_EXPOSURE (IMX335_VT_PIX_CLK_HZ / 10000)
+
+/* Lane rate measured from the line burst length; equals the PLL */
+
+#define IMX335_LINK_MBPS         1188
+#define IMX335_LANES             2
+#define IMX335_CSI_DT_RAW10      0x2b
 
 /* Gain in 0.3 dB steps, 0 to 72 dB (Zephyr IMX335_GAIN_UNIT_MDB) */
 
 #define IMX335_GAIN_MAX          240
+
+/* Steps up to 30 dB are analogue; one step is 10^(0.3/20) in Q16.16 */
+
+#define IMX335_AGAIN_MAX         100
+#define IMX335_GAIN_STEP_Q16     67840
 
 /* Registers */
 
@@ -96,24 +128,38 @@
  * Private Types
  ****************************************************************************/
 
-struct imx335_reg_s
-{
-  uint16_t addr;
-  uint8_t  val;
-};
-
 struct imx335_inck_s
 {
   uint32_t freq;
-  struct imx335_reg_s regs[7];
+  struct csi_sensor_reg_s regs[7];
+};
+
+struct imx335_mode_s
+{
+  uint16_t width;
+  uint16_t height;
+  uint8_t max_fps;
+  uint8_t shr0_min;
+  uint8_t hmax_per_line;              /* HMAX periods per output line */
+  uint8_t pre_active_lines;           /* Line periods from FS to image */
+  FAR const struct csi_sensor_reg_s *regs;
+  size_t nregs;
+};
+
+struct imx335_rate_s
+{
+  uint8_t fps;
+  uint16_t hmax;                      /* Line length, 74.25 MHz clocks */
 };
 
 struct imx335_dev_s
 {
-  struct imgsensor_s sensor;          /* Must be first */
-  FAR struct i2c_master_s *i2c;       /* I2C bus */
+  struct imgsensor_s sensor;          /* must be first */
+  struct csi_sensor_cci_s cci;        /* Little endian registers */
   mutex_t lock;                       /* Serializes the sensor access */
   FAR const struct imx335_inck_s *inck;
+  FAR const struct imx335_mode_s *mode;
+  FAR const struct imx335_rate_s *rate;
   uint32_t exposure;                  /* Exposure time in 100 us units */
   uint32_t gain;                      /* Gain in 0.3 dB steps */
   bool streaming;
@@ -127,7 +173,7 @@ static bool imx335_is_available(FAR struct imgsensor_s *sensor);
 static int imx335_init(FAR struct imgsensor_s *sensor);
 static int imx335_uninit(FAR struct imgsensor_s *sensor);
 static FAR const char *
-imx335_get_driver_name(FAR struct imgsensor_s *sensor);
+  imx335_get_driver_name(FAR struct imgsensor_s *sensor);
 static int imx335_validate_frame_setting(FAR struct imgsensor_s *sensor,
                                          imgsensor_stream_type_t type,
                                          uint8_t nr_datafmts,
@@ -140,18 +186,17 @@ static int imx335_start_capture(FAR struct imgsensor_s *sensor,
                                 FAR imgsensor_interval_t *interval);
 static int imx335_stop_capture(FAR struct imgsensor_s *sensor,
                                imgsensor_stream_type_t type);
-static int imx335_get_frame_interval(FAR struct imgsensor_s *sensor,
-                                     imgsensor_stream_type_t type,
-                                     FAR imgsensor_interval_t *interval);
+static int imx335_get_mipi_csi_config(FAR struct imgsensor_s *sensor,
+                                      FAR const imgsensor_format_t *fmt,
+                                      FAR const imgsensor_interval_t *ival,
+                                      FAR imgsensor_mipi_csi_cfg_t *config);
 static int imx335_get_supported_value(FAR struct imgsensor_s *sensor,
                                       uint32_t id,
                                       FAR imgsensor_supported_value_t *val);
-static int imx335_get_value(FAR struct imgsensor_s *sensor,
-                            uint32_t id, uint32_t size,
-                            FAR imgsensor_value_t *value);
-static int imx335_set_value(FAR struct imgsensor_s *sensor,
-                            uint32_t id, uint32_t size,
-                            imgsensor_value_t value);
+static int imx335_get_value(FAR struct imgsensor_s *sensor, uint32_t id,
+                            uint32_t size, FAR imgsensor_value_t *value);
+static int imx335_set_value(FAR struct imgsensor_s *sensor, uint32_t id,
+                            uint32_t size, imgsensor_value_t value);
 
 /****************************************************************************
  * Private Data
@@ -162,7 +207,7 @@ static int imx335_set_value(FAR struct imgsensor_s *sensor,
  * imx335_fixed_regs).  Multi-byte registers are little endian.
  */
 
-static const struct imx335_reg_s g_imx335_init_regs[] =
+static const struct csi_sensor_reg_s g_imx335_init_regs[] =
 {
   { 0x3000, 0x01 },
   { 0x3002, 0x00 },
@@ -247,21 +292,22 @@ static const struct imx335_reg_s g_imx335_init_regs[] =
   { 0x3a00, 0x01 },
 };
 
-/* All-pixel scan without binning (Zephyr imx335_bin_none), the 30 frames
- * per second line length and 2 lanes with 10 bits (Zephyr
- * imx335_mode_2l_10b).
+/* All-pixel scan without binning (Zephyr imx335_bin_none), which also
+ * resets everything that the binned mode changes.
  */
 
-static const struct imx335_reg_s g_imx335_mode_regs[] =
+static const struct csi_sensor_reg_s g_imx335_full_regs[] =
 {
   { 0x3018, 0x00 },
-  { 0x3056, 0xac },
+  { 0x302e, 0x20 },
+  { 0x302f, 0x0a },
+  { 0x3056, 0x98 },
   { 0x3057, 0x07 },
   { 0x3072, 0x28 },
   { 0x3073, 0x00 },
-  { 0x3074, 0xb0 },
+  { 0x3074, 0xc8 },
   { 0x3075, 0x00 },
-  { 0x3076, 0x58 },
+  { 0x3076, 0x30 },
   { 0x3077, 0x0f },
   { 0x3199, 0x00 },
   { 0x3300, 0x00 },
@@ -296,15 +342,93 @@ static const struct imx335_reg_s g_imx335_mode_regs[] =
   { 0x3113, 0x00 },
   { 0x3116, 0x08 },
   { 0x3117, 0x00 },
-  { 0x3001, 0x01 },
-  { 0x3034, IMX335_HMAX & 0xff },
-  { 0x3035, IMX335_HMAX >> 8 },
-  { 0x3001, 0x00 },
+};
+
+/* 2/2 binning (Zephyr imx335_bin_2x2), 1296x972 */
+
+static const struct csi_sensor_reg_s g_imx335_bin_regs[] =
+{
+  { 0x3018, 0x01 },
+  { 0x302e, 0x08 },
+  { 0x302f, 0x0a },
+  { 0x3056, 0xcc },
+  { 0x3057, 0x03 },
+  { 0x3072, 0x30 },
+  { 0x3073, 0x00 },
+  { 0x3074, 0xc8 },
+  { 0x3075, 0x00 },
+  { 0x3076, 0x30 },
+  { 0x3077, 0x0f },
+  { 0x3199, 0x30 },
+  { 0x3300, 0x01 },
+  { 0x3078, 0x04 },
+  { 0x3079, 0xfd },
+  { 0x307a, 0x04 },
+  { 0x307b, 0xfe },
+  { 0x307c, 0x04 },
+  { 0x307d, 0xfb },
+  { 0x307e, 0x04 },
+  { 0x307f, 0x02 },
+  { 0x3080, 0x04 },
+  { 0x3081, 0xfd },
+  { 0x3082, 0x04 },
+  { 0x3083, 0xfe },
+  { 0x3084, 0x04 },
+  { 0x3085, 0xfb },
+  { 0x3086, 0x04 },
+  { 0x3087, 0x02 },
+  { 0x30a4, 0x77 },
+  { 0x30a8, 0x20 },
+  { 0x30a9, 0x00 },
+  { 0x30ac, 0x08 },
+  { 0x30ad, 0x08 },
+  { 0x30b0, 0x20 },
+  { 0x30b1, 0x00 },
+  { 0x30b4, 0x10 },
+  { 0x30b5, 0x10 },
+  { 0x30b6, 0x00 },
+  { 0x30b7, 0x00 },
+  { 0x3112, 0x10 },
+  { 0x3113, 0x00 },
+  { 0x3116, 0x10 },
+  { 0x3117, 0x00 },
+};
+
+/* 2 lanes with 10 bits (Zephyr imx335_mode_2l_10b) */
+
+static const struct csi_sensor_reg_s g_imx335_lane_regs[] =
+{
   { 0x3050, 0x00 },
   { 0x319d, 0x00 },
   { 0x341c, 0xff },
   { 0x341d, 0x01 },
   { 0x3a01, 0x01 },
+};
+
+/* Binned mode first: it is the default */
+
+static const struct imx335_mode_s g_imx335_mode[] =
+{
+  {
+    IMX335_BIN_WIDTH, IMX335_BIN_HEIGHT, 60, IMX335_SHR0_MIN_BIN, 4, 14,
+    g_imx335_bin_regs, nitems(g_imx335_bin_regs),
+  },
+  {
+    IMX335_WIDTH, IMX335_HEIGHT, 30, IMX335_SHR0_MIN, 2, 22,
+    g_imx335_full_regs, nitems(g_imx335_full_regs),
+  },
+};
+
+/* The line length is the same with and without binning; the first is the
+ * default.
+ */
+
+static const struct imx335_rate_s g_imx335_rate[] =
+{
+  { 30, 0x0226 },
+  { 25, 0x0294 },
+  { 50, 0x014a },
+  { 60, 0x0113 },
 };
 
 /* Input clock (INCK) dependent settings (Zephyr imx335_inck_*) */
@@ -382,16 +506,40 @@ static const struct imgsensor_ops_s g_imx335_ops =
   .validate_frame_setting = imx335_validate_frame_setting,
   .start_capture          = imx335_start_capture,
   .stop_capture           = imx335_stop_capture,
-  .get_frame_interval     = imx335_get_frame_interval,
   .get_supported_value    = imx335_get_supported_value,
   .get_value              = imx335_get_value,
   .set_value              = imx335_set_value,
+  .get_mipi_csi_config    = imx335_get_mipi_csi_config,
+};
+
+static const imgsensor_mipi_csi_mode_t g_imx335_modes[] =
+{
+  {
+    .pixelformat = V4L2_PIX_FMT_SRGGB10,
+    .width       = IMX335_BIN_WIDTH,
+    .height      = IMX335_BIN_HEIGHT,
+    .interval    =
+      {
+        .numerator   = 1,
+        .denominator = IMX335_FPS_DEFAULT,
+      },
+  },
+  {
+    .pixelformat = V4L2_PIX_FMT_SRGGB10,
+    .width       = IMX335_WIDTH,
+    .height      = IMX335_HEIGHT,
+    .interval    =
+      {
+        .numerator   = 1,
+        .denominator = IMX335_FPS_DEFAULT,
+      },
+  },
 };
 
 static const struct v4l2_fmtdesc g_imx335_fmtdescs[] =
 {
   {
-    .pixelformat = V4L2_PIX_FMT_SRGGB10P,
+    .pixelformat = V4L2_PIX_FMT_SRGGB10,
     .description = "RAW10 RGGB",
   },
 };
@@ -402,21 +550,39 @@ static const struct v4l2_frmsizeenum g_imx335_frmsizes[] =
     .type = V4L2_FRMSIZE_TYPE_DISCRETE,
     .discrete =
       {
+        .width  = IMX335_BIN_WIDTH,
+        .height = IMX335_BIN_HEIGHT,
+      },
+  },
+  {
+    .type = V4L2_FRMSIZE_TYPE_DISCRETE,
+    .discrete =
+      {
         .width  = IMX335_WIDTH,
         .height = IMX335_HEIGHT,
       },
   },
 };
 
+/* All rates of g_imx335_rate; 50 and 60 are only possible when binning */
+
 static const struct v4l2_frmivalenum g_imx335_frmintervals[] =
 {
   {
     .type = V4L2_FRMIVAL_TYPE_DISCRETE,
-    .discrete =
-      {
-        .numerator   = 1,
-        .denominator = IMX335_FPS,
-      },
+    .discrete = { .numerator = 1, .denominator = 30 },
+  },
+  {
+    .type = V4L2_FRMIVAL_TYPE_DISCRETE,
+    .discrete = { .numerator = 1, .denominator = 25 },
+  },
+  {
+    .type = V4L2_FRMIVAL_TYPE_DISCRETE,
+    .discrete = { .numerator = 1, .denominator = 50 },
+  },
+  {
+    .type = V4L2_FRMIVAL_TYPE_DISCRETE,
+    .discrete = { .numerator = 1, .denominator = 60 },
   },
 };
 
@@ -425,90 +591,73 @@ static const struct v4l2_frmivalenum g_imx335_frmintervals[] =
  ****************************************************************************/
 
 /****************************************************************************
- * Name: imx335_putreg
+ * Name: imx335_find_mode
  ****************************************************************************/
 
-static int imx335_putreg(FAR struct imx335_dev_s *priv, uint16_t regaddr,
-                         uint32_t regval, uint8_t len)
+static FAR const struct imx335_mode_s *imx335_find_mode(uint32_t width,
+                                                        uint32_t height)
 {
-  struct i2c_msg_s msg;
-  uint8_t buf[5];
-  int ret;
   int i;
 
-  /* 16-bit register address, multi-byte values are little endian */
-
-  buf[0] = regaddr >> 8;
-  buf[1] = regaddr & 0xff;
-  for (i = 0; i < len; i++)
+  for (i = 0; i < nitems(g_imx335_mode); i++)
     {
-      buf[2 + i] = (regval >> (8 * i)) & 0xff;
-    }
-
-  msg.frequency = IMX335_I2C_FREQ;
-  msg.addr      = IMX335_I2C_ADDR;
-  msg.flags     = 0;
-  msg.buffer    = buf;
-  msg.length    = 2 + len;
-
-  ret = I2C_TRANSFER(priv->i2c, &msg, 1);
-  if (ret < 0)
-    {
-      snerr("ERROR: write 0x%04x failed: %d\n", regaddr, ret);
-    }
-
-  return ret;
-}
-
-/****************************************************************************
- * Name: imx335_getreg
- ****************************************************************************/
-
-static int imx335_getreg(FAR struct imx335_dev_s *priv, uint16_t regaddr,
-                         FAR uint8_t *regval)
-{
-  struct i2c_msg_s msg[2];
-  uint8_t buf[2];
-
-  buf[0] = regaddr >> 8;
-  buf[1] = regaddr & 0xff;
-
-  msg[0].frequency = IMX335_I2C_FREQ;
-  msg[0].addr      = IMX335_I2C_ADDR;
-  msg[0].flags     = 0;
-  msg[0].buffer    = buf;
-  msg[0].length    = 2;
-
-  msg[1].frequency = IMX335_I2C_FREQ;
-  msg[1].addr      = IMX335_I2C_ADDR;
-  msg[1].flags     = I2C_M_READ;
-  msg[1].buffer    = regval;
-  msg[1].length    = 1;
-
-  return I2C_TRANSFER(priv->i2c, msg, 2);
-}
-
-/****************************************************************************
- * Name: imx335_putreglist
- ****************************************************************************/
-
-static int imx335_putreglist(FAR struct imx335_dev_s *priv,
-                             FAR const struct imx335_reg_s *regs,
-                             size_t nregs)
-{
-  size_t i;
-  int ret;
-
-  for (i = 0; i < nregs; i++)
-    {
-      ret = imx335_putreg(priv, regs[i].addr, regs[i].val, 1);
-      if (ret < 0)
+      if (g_imx335_mode[i].width == width &&
+          g_imx335_mode[i].height == height)
         {
-          return ret;
+          return &g_imx335_mode[i];
         }
     }
 
-  return OK;
+  return NULL;
+}
+
+/****************************************************************************
+ * Name: imx335_find_rate
+ *
+ * Description:
+ *   The line length of a frame interval that the mode can do; the default
+ *   rate when no interval is given.
+ *
+ ****************************************************************************/
+
+static FAR const struct imx335_rate_s *
+imx335_find_rate(FAR const struct imx335_mode_s *mode,
+                 FAR const imgsensor_interval_t *interval)
+{
+  int i;
+
+  if (interval == NULL || interval->numerator == 0 ||
+      interval->denominator == 0)
+    {
+      return &g_imx335_rate[0];
+    }
+
+  for (i = 0; i < nitems(g_imx335_rate); i++)
+    {
+      if (g_imx335_rate[i].fps <= mode->max_fps &&
+          interval->numerator * g_imx335_rate[i].fps ==
+          interval->denominator)
+        {
+          return &g_imx335_rate[i];
+        }
+    }
+
+  return NULL;
+}
+
+/****************************************************************************
+ * Name: imx335_maxexposure
+ *
+ * Description:
+ *   The longest exposure time in 100 us units: the frame less the first
+ *   shutter line.
+ *
+ ****************************************************************************/
+
+static uint32_t imx335_maxexposure(FAR const struct imx335_dev_s *priv)
+{
+  return (IMX335_VMAX - priv->mode->shr0_min) * priv->rate->hmax /
+         IMX335_CLKS_PER_EXPOSURE;
 }
 
 /****************************************************************************
@@ -516,7 +665,7 @@ static int imx335_putreglist(FAR struct imx335_dev_s *priv,
  *
  * Description:
  *   Program the shutter for an exposure time in 100 us units.  One line
- *   lasts 1 / (VMAX * fps) seconds.
+ *   lasts HMAX clocks of 74.25 MHz.
  *
  ****************************************************************************/
 
@@ -527,24 +676,24 @@ static int imx335_setexposure(FAR struct imx335_dev_s *priv,
   uint32_t shr;
   int ret;
 
-  lines = exposure * IMX335_VMAX * IMX335_FPS / 10000;
+  lines = exposure * IMX335_CLKS_PER_EXPOSURE / priv->rate->hmax;
   if (lines < 1)
     {
       lines = 1;
     }
 
-  if (lines > IMX335_VMAX - IMX335_SHR0_MIN)
+  if (lines > IMX335_VMAX - priv->mode->shr0_min)
     {
-      lines = IMX335_VMAX - IMX335_SHR0_MIN;
+      lines = IMX335_VMAX - priv->mode->shr0_min;
     }
 
   shr = IMX335_VMAX - lines;
 
-  ret = imx335_putreg(priv, IMX335_REG_REGHOLD, 1, 1);
+  ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_REGHOLD, 1);
   if (ret >= 0)
     {
-      ret = imx335_putreg(priv, IMX335_REG_SHR0, shr, 3);
-      imx335_putreg(priv, IMX335_REG_REGHOLD, 0, 1);
+      ret = csi_sensor_cci_write24(&priv->cci, IMX335_REG_SHR0, shr);
+      csi_sensor_cci_write8(&priv->cci, IMX335_REG_REGHOLD, 0);
     }
 
   if (ret >= 0)
@@ -556,6 +705,50 @@ static int imx335_setexposure(FAR struct imx335_dev_s *priv,
 }
 
 /****************************************************************************
+ * Name: imx335_gain_q16
+ ****************************************************************************/
+
+static uint32_t imx335_gain_q16(uint32_t code)
+{
+  uint64_t gain = 1 << 16;
+
+  while (code-- > 0)
+    {
+      gain = gain * IMX335_GAIN_STEP_Q16 >> 16;
+    }
+
+  return (uint32_t)gain;
+}
+
+/****************************************************************************
+ * Name: imx335_gain_code
+ *
+ * Description:
+ *   The analogue gain step nearest to a linear Q16.16 gain.
+ *
+ ****************************************************************************/
+
+static uint32_t imx335_gain_code(uint32_t gain_q16)
+{
+  uint64_t gain = 1 << 16;
+  uint64_t next;
+  uint32_t code;
+
+  for (code = 0; code < IMX335_AGAIN_MAX; code++)
+    {
+      next = gain * IMX335_GAIN_STEP_Q16 >> 16;
+      if (2 * (uint64_t)gain_q16 < gain + next)
+        {
+          break;
+        }
+
+      gain = next;
+    }
+
+  return code;
+}
+
+/****************************************************************************
  * Name: imx335_setgain
  ****************************************************************************/
 
@@ -563,16 +756,54 @@ static int imx335_setgain(FAR struct imx335_dev_s *priv, uint32_t gain)
 {
   int ret;
 
-  ret = imx335_putreg(priv, IMX335_REG_REGHOLD, 1, 1);
+  ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_REGHOLD, 1);
   if (ret >= 0)
     {
-      ret = imx335_putreg(priv, IMX335_REG_GAIN, gain, 2);
-      imx335_putreg(priv, IMX335_REG_REGHOLD, 0, 1);
+      ret = csi_sensor_cci_write16(&priv->cci, IMX335_REG_GAIN, gain);
+      csi_sensor_cci_write8(&priv->cci, IMX335_REG_REGHOLD, 0);
     }
 
   if (ret >= 0)
     {
       priv->gain = gain;
+    }
+
+  return ret;
+}
+
+/****************************************************************************
+ * Name: imx335_setmode
+ *
+ * Description:
+ *   Program the readout mode and the line length of the frame rate with
+ *   the sensor in standby, then the exposure again, as the line length
+ *   changes the unit of the shutter.
+ *
+ ****************************************************************************/
+
+static int imx335_setmode(FAR struct imx335_dev_s *priv,
+                          FAR const struct imx335_mode_s *mode,
+                          FAR const struct imx335_rate_s *rate)
+{
+  int ret;
+
+  ret = csi_sensor_cci_write_list(&priv->cci, mode->regs, mode->nregs);
+  if (ret >= 0)
+    {
+      ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_REGHOLD, 1);
+    }
+
+  if (ret >= 0)
+    {
+      ret = csi_sensor_cci_write16(&priv->cci, IMX335_REG_HMAX, rate->hmax);
+      csi_sensor_cci_write8(&priv->cci, IMX335_REG_REGHOLD, 0);
+    }
+
+  if (ret >= 0)
+    {
+      priv->mode = mode;
+      priv->rate = rate;
+      ret = imx335_setexposure(priv, priv->exposure);
     }
 
   return ret;
@@ -585,24 +816,17 @@ static int imx335_setgain(FAR struct imx335_dev_s *priv, uint32_t gain)
 static bool imx335_is_available(FAR struct imgsensor_s *sensor)
 {
   FAR struct imx335_dev_s *priv = (FAR struct imx335_dev_s *)sensor;
-  uint8_t vmax[3];
-  int ret = OK;
-  int i;
+  uint32_t vmax = 0;
+  int ret;
 
-  /* There is no ID register; VMAX keeps its reset value of 4500 lines as
-   * the driver never changes it.
+  /* There is no ID register; a successful read of VMAX shows the sensor
+   * answers on the bus.
    */
 
   nxmutex_lock(&priv->lock);
-  for (i = 0; i < 3 && ret >= 0; i++)
-    {
-      ret = imx335_getreg(priv, IMX335_REG_VMAX + i, &vmax[i]);
-    }
-
+  ret = csi_sensor_cci_read24(&priv->cci, IMX335_REG_VMAX, &vmax);
   nxmutex_unlock(&priv->lock);
-  return ret >= 0 &&
-         (vmax[0] | (vmax[1] << 8) | ((uint32_t)vmax[2] << 16)) ==
-         IMX335_VMAX;
+  return ret >= 0;
 }
 
 /****************************************************************************
@@ -615,18 +839,18 @@ static int imx335_init(FAR struct imgsensor_s *sensor)
   int ret;
 
   nxmutex_lock(&priv->lock);
-  ret = imx335_putreglist(priv, g_imx335_init_regs,
-                          nitems(g_imx335_init_regs));
+  ret = csi_sensor_cci_write_list(&priv->cci, g_imx335_init_regs,
+                                  nitems(g_imx335_init_regs));
   if (ret >= 0)
     {
-      ret = imx335_putreglist(priv, g_imx335_mode_regs,
-                              nitems(g_imx335_mode_regs));
+      ret = csi_sensor_cci_write_list(&priv->cci, g_imx335_lane_regs,
+                                      nitems(g_imx335_lane_regs));
     }
 
   if (ret >= 0)
     {
-      ret = imx335_putreglist(priv, priv->inck->regs,
-                              nitems(priv->inck->regs));
+      ret = csi_sensor_cci_write_list(&priv->cci, priv->inck->regs,
+                                      nitems(priv->inck->regs));
     }
 
   if (ret >= 0)
@@ -636,7 +860,7 @@ static int imx335_init(FAR struct imgsensor_s *sensor)
 
   if (ret >= 0)
     {
-      ret = imx335_setexposure(priv, priv->exposure);
+      ret = imx335_setmode(priv, &g_imx335_mode[0], &g_imx335_rate[0]);
     }
 
   if (ret < 0)
@@ -660,7 +884,8 @@ static int imx335_uninit(FAR struct imgsensor_s *sensor)
 
   nxmutex_lock(&priv->lock);
   priv->streaming = false;
-  ret = imx335_putreg(priv, IMX335_REG_STANDBY, IMX335_STANDBY, 1);
+  ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_STANDBY,
+                              IMX335_STANDBY);
   nxmutex_unlock(&priv->lock);
   return ret;
 }
@@ -676,6 +901,54 @@ imx335_get_driver_name(FAR struct imgsensor_s *sensor)
 }
 
 /****************************************************************************
+ * Name: imx335_get_mipi_csi_config
+ ****************************************************************************/
+
+static int imx335_get_mipi_csi_config(FAR struct imgsensor_s *sensor,
+                                      FAR const imgsensor_format_t *fmt,
+                                      FAR const imgsensor_interval_t *ival,
+                                      FAR imgsensor_mipi_csi_cfg_t *config)
+{
+  FAR const struct imx335_mode_s *mode;
+  FAR const struct imx335_rate_s *rate;
+
+  if (config == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (csi_sensor_find_mode(g_imx335_modes, nitems(g_imx335_modes),
+                           fmt) == NULL)
+    {
+      return -ENOTSUP;
+    }
+
+  mode = imx335_find_mode(fmt->width, fmt->height);
+  if (mode == NULL)
+    {
+      return -ENOTSUP;
+    }
+
+  rate = imx335_find_rate(mode, ival);
+  if (rate == NULL)
+    {
+      return -ERANGE;
+    }
+
+  memset(config, 0, sizeof(*config));
+  config->link_mbps_per_lane = IMX335_LINK_MBPS;
+  config->line_length_pck    = mode->hmax_per_line * rate->hmax;
+  config->frame_length_lines = IMX335_VMAX / mode->hmax_per_line;
+  config->vt_pix_clk_hz      = IMX335_VT_PIX_CLK_HZ;
+  config->n_lanes            = IMX335_LANES;
+  config->data_type          = IMX335_CSI_DT_RAW10;
+  config->pre_active_lines   = mode->pre_active_lines;
+
+  config->line_sync          = IMGSENSOR_LINE_SYNC_NONE;
+  return OK;
+}
+
+/****************************************************************************
  * Name: imx335_validate_frame_setting
  ****************************************************************************/
 
@@ -685,21 +958,15 @@ static int imx335_validate_frame_setting(FAR struct imgsensor_s *sensor,
                                          FAR imgsensor_format_t *datafmts,
                                          FAR imgsensor_interval_t *interval)
 {
-  FAR imgsensor_format_t *fmt;
+  imgsensor_mipi_csi_cfg_t cfg;
 
-  if (nr_datafmts != 1 || datafmts == NULL)
+  if (nr_datafmts < 1 || datafmts == NULL)
     {
       return -EINVAL;
     }
 
-  fmt = &datafmts[IMGSENSOR_FMT_MAIN];
-  if (fmt->pixelformat != IMGSENSOR_PIX_FMT_SRGGB10P ||
-      fmt->width != IMX335_WIDTH || fmt->height != IMX335_HEIGHT)
-    {
-      return -EINVAL;
-    }
-
-  return OK;
+  return imx335_get_mipi_csi_config(sensor, &datafmts[IMGSENSOR_FMT_MAIN],
+                                    interval, &cfg);
 }
 
 /****************************************************************************
@@ -713,12 +980,54 @@ static int imx335_start_capture(FAR struct imgsensor_s *sensor,
                                 FAR imgsensor_interval_t *interval)
 {
   FAR struct imx335_dev_s *priv = (FAR struct imx335_dev_s *)sensor;
+  FAR const struct imx335_mode_s *mode;
+  FAR const struct imx335_rate_s *rate;
   int ret = OK;
 
-  nxmutex_lock(&priv->lock);
-  if (!priv->streaming)
+  if (nr_datafmts < 1 || datafmts == NULL)
     {
-      ret = imx335_putreg(priv, IMX335_REG_STANDBY, IMX335_OPERATING, 1);
+      return -EINVAL;
+    }
+
+  mode = imx335_find_mode(datafmts[IMGSENSOR_FMT_MAIN].width,
+                          datafmts[IMGSENSOR_FMT_MAIN].height);
+  if (mode == NULL)
+    {
+      return -ENOTSUP;
+    }
+
+  rate = imx335_find_rate(mode, interval);
+  if (rate == NULL)
+    {
+      return -ERANGE;
+    }
+
+  nxmutex_lock(&priv->lock);
+
+  /* The mode is only changed in standby; the capture framework may have
+   * left the sensor streaming (see imx335_stop_capture).
+   */
+
+  if (priv->streaming && (mode != priv->mode || rate != priv->rate))
+    {
+      ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_STANDBY,
+                                  IMX335_STANDBY);
+      priv->streaming = false;
+    }
+
+  if (ret >= 0 && !priv->streaming)
+    {
+      if (mode != priv->mode || rate != priv->rate)
+        {
+          ret = imx335_setmode(priv, mode, rate);
+        }
+
+      if (ret >= 0)
+        {
+          ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_STANDBY,
+                                      IMX335_OPERATING);
+        }
+
       if (ret >= 0)
         {
           /* Settling time after leaving standby, as in the Zephyr
@@ -758,24 +1067,12 @@ static int imx335_stop_capture(FAR struct imgsensor_s *sensor,
   if (priv->streaming)
     {
       priv->streaming = false;
-      ret = imx335_putreg(priv, IMX335_REG_STANDBY, IMX335_STANDBY, 1);
+      ret = csi_sensor_cci_write8(&priv->cci, IMX335_REG_STANDBY,
+                                  IMX335_STANDBY);
     }
 
   nxmutex_unlock(&priv->lock);
   return ret;
-}
-
-/****************************************************************************
- * Name: imx335_get_frame_interval
- ****************************************************************************/
-
-static int imx335_get_frame_interval(FAR struct imgsensor_s *sensor,
-                                     imgsensor_stream_type_t type,
-                                     FAR imgsensor_interval_t *interval)
-{
-  interval->numerator   = 1;
-  interval->denominator = IMX335_FPS;
-  return OK;
 }
 
 /****************************************************************************
@@ -786,14 +1083,22 @@ static int imx335_get_supported_value(FAR struct imgsensor_s *sensor,
                                       uint32_t id,
                                       FAR imgsensor_supported_value_t *val)
 {
+  FAR struct imx335_dev_s *priv = (FAR struct imx335_dev_s *)sensor;
+  uint32_t maximum;
+
   switch (id)
     {
       case IMGSENSOR_ID_EXPOSURE_ABSOLUTE:
+        nxmutex_lock(&priv->lock);
+        maximum = imx335_maxexposure(priv);
+        nxmutex_unlock(&priv->lock);
+
         val->type                  = IMGSENSOR_CTRL_TYPE_INTEGER;
         val->u.range.minimum       = 1;
-        val->u.range.maximum       = 10000 / IMX335_FPS;
+        val->u.range.maximum       = maximum;
         val->u.range.step          = 1;
-        val->u.range.default_value = CONFIG_VIDEO_IMX335_EXPOSURE;
+        val->u.range.default_value = MIN(CONFIG_VIDEO_IMX335_EXPOSURE,
+                                         maximum);
         return OK;
 
       case IMGSENSOR_ID_GAIN:
@@ -802,6 +1107,15 @@ static int imx335_get_supported_value(FAR struct imgsensor_s *sensor,
         val->u.range.maximum       = IMX335_GAIN_MAX;
         val->u.range.step          = 1;
         val->u.range.default_value = CONFIG_VIDEO_IMX335_GAIN;
+        return OK;
+
+      case IMGSENSOR_ID_ANALOGUE_GAIN:
+        val->type                  = IMGSENSOR_CTRL_TYPE_INTEGER;
+        val->u.range.minimum       = imx335_gain_q16(0);
+        val->u.range.maximum       = imx335_gain_q16(IMX335_AGAIN_MAX);
+        val->u.range.step          = 1;
+        val->u.range.default_value =
+          imx335_gain_q16(MIN(CONFIG_VIDEO_IMX335_GAIN, IMX335_AGAIN_MAX));
         return OK;
 
       default:
@@ -813,9 +1127,8 @@ static int imx335_get_supported_value(FAR struct imgsensor_s *sensor,
  * Name: imx335_get_value
  ****************************************************************************/
 
-static int imx335_get_value(FAR struct imgsensor_s *sensor,
-                            uint32_t id, uint32_t size,
-                            FAR imgsensor_value_t *value)
+static int imx335_get_value(FAR struct imgsensor_s *sensor, uint32_t id,
+                            uint32_t size, FAR imgsensor_value_t *value)
 {
   FAR struct imx335_dev_s *priv = (FAR struct imx335_dev_s *)sensor;
   int ret = OK;
@@ -831,6 +1144,10 @@ static int imx335_get_value(FAR struct imgsensor_s *sensor,
         value->value32 = priv->gain;
         break;
 
+      case IMGSENSOR_ID_ANALOGUE_GAIN:
+        value->value32 = imx335_gain_q16(MIN(priv->gain, IMX335_AGAIN_MAX));
+        break;
+
       default:
         ret = -EINVAL;
         break;
@@ -844,9 +1161,8 @@ static int imx335_get_value(FAR struct imgsensor_s *sensor,
  * Name: imx335_set_value
  ****************************************************************************/
 
-static int imx335_set_value(FAR struct imgsensor_s *sensor,
-                            uint32_t id, uint32_t size,
-                            imgsensor_value_t value)
+static int imx335_set_value(FAR struct imgsensor_s *sensor, uint32_t id,
+                            uint32_t size, imgsensor_value_t value)
 {
   FAR struct imx335_dev_s *priv = (FAR struct imx335_dev_s *)sensor;
   int ret;
@@ -854,12 +1170,13 @@ static int imx335_set_value(FAR struct imgsensor_s *sensor,
   switch (id)
     {
       case IMGSENSOR_ID_EXPOSURE_ABSOLUTE:
-        if (value.value32 < 1 || value.value32 > 10000 / IMX335_FPS)
+        nxmutex_lock(&priv->lock);
+        if (value.value32 < 1 || value.value32 > imx335_maxexposure(priv))
           {
+            nxmutex_unlock(&priv->lock);
             return -EINVAL;
           }
 
-        nxmutex_lock(&priv->lock);
         ret = imx335_setexposure(priv, value.value32);
         nxmutex_unlock(&priv->lock);
         return ret;
@@ -872,6 +1189,17 @@ static int imx335_set_value(FAR struct imgsensor_s *sensor,
 
         nxmutex_lock(&priv->lock);
         ret = imx335_setgain(priv, value.value32);
+        nxmutex_unlock(&priv->lock);
+        return ret;
+
+      case IMGSENSOR_ID_ANALOGUE_GAIN:
+        if (value.value32 <= 0)
+          {
+            return -EINVAL;
+          }
+
+        nxmutex_lock(&priv->lock);
+        ret = imx335_setgain(priv, imx335_gain_code(value.value32));
         nxmutex_unlock(&priv->lock);
         return ret;
 
@@ -921,18 +1249,32 @@ FAR struct imgsensor_s *imx335_initialize(FAR struct i2c_master_s *i2c,
       return NULL;
     }
 
-  priv->i2c      = i2c;
+  priv->sensor.ops                = &g_imx335_ops;
+  priv->sensor.fmtdescs_num       = nitems(g_imx335_fmtdescs);
+  priv->sensor.fmtdescs           = g_imx335_fmtdescs;
+  priv->sensor.frmsizes_num       = nitems(g_imx335_frmsizes);
+  priv->sensor.frmsizes           = g_imx335_frmsizes;
+  priv->sensor.frmintervals_num   = nitems(g_imx335_frmintervals);
+  priv->sensor.frmintervals       = g_imx335_frmintervals;
+  priv->sensor.mipi_csi_modes_num = nitems(g_imx335_modes);
+  priv->sensor.mipi_csi_modes     = g_imx335_modes;
+
+  priv->cci.i2c  = i2c;
+  priv->cci.addr = IMX335_I2C_ADDR;
+  priv->cci.freq = IMX335_I2C_FREQ;
+  priv->cci.le   = true;
+  priv->mode     = &g_imx335_mode[0];
+  priv->rate     = &g_imx335_rate[0];
   nxmutex_init(&priv->lock);
   priv->exposure = CONFIG_VIDEO_IMX335_EXPOSURE;
   priv->gain     = CONFIG_VIDEO_IMX335_GAIN;
 
-  priv->sensor.ops              = &g_imx335_ops;
-  priv->sensor.fmtdescs         = g_imx335_fmtdescs;
-  priv->sensor.fmtdescs_num     = nitems(g_imx335_fmtdescs);
-  priv->sensor.frmsizes         = g_imx335_frmsizes;
-  priv->sensor.frmsizes_num     = nitems(g_imx335_frmsizes);
-  priv->sensor.frmintervals     = g_imx335_frmintervals;
-  priv->sensor.frmintervals_num = nitems(g_imx335_frmintervals);
+  if (!imx335_is_available(&priv->sensor))
+    {
+      nxmutex_destroy(&priv->lock);
+      kmm_free(priv);
+      return NULL;
+    }
 
   return &priv->sensor;
 }
