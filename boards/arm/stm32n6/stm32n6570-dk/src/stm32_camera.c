@@ -73,23 +73,14 @@
 
 #ifdef HAVE_IMX335
 
-/* IMX335: 2592x1944 RAW10 RGGB on two CSI-2 lanes.  The D-PHY receives the
- * sensor without errors when set to 800 to 1600 Mbit/s per lane (measured on
- * the DK); 1200 is the middle of that range.  The black level of 12 (8-bit
- * scale) is the dark level measured with the lens covered at the minimum
- * gain and exposure.  Unity white balance gains and an identity colour
- * matrix.  The sensor gain has 0.3 dB steps: 20 steps double it.
+/* IMX335 image processing.  The black level of 12 (8-bit scale) is the dark
+ * level measured with the lens covered at the minimum gain and exposure.
+ * Unity white balance gains and an identity colour matrix.  The sensor gain
+ * has 0.3 dB steps: 20 steps double it.
  */
 
 static const struct stm32_dcmipp_config_s g_camera_config =
 {
-  .width       = 2592,
-  .height      = 1944,
-  .pixelformat = IMGSENSOR_PIX_FMT_SRGGB10P,
-  .lanes       = 2,
-  .bitrate     = 1200,
-  .bpp         = 10,
-  .bayer       = STM32_DCMIPP_BAYER_RGGB,
   .blacklevel  = 12,
   .gain        =
     {
