@@ -34,6 +34,7 @@
 #include <nuttx/i2c/i2c_master.h>
 #include <nuttx/video/imgsensor.h>
 #include <nuttx/video/imx335.h>
+#include <nuttx/video/imx219.h>
 #include <nuttx/video/v4l2_cap.h>
 
 #include "stm32_gpio.h"
@@ -45,8 +46,9 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#if defined(CONFIG_STM32_DCMIPP) && defined(CONFIG_VIDEO_IMX335)
-#  define HAVE_IMX335 1
+#if defined(CONFIG_STM32_DCMIPP) && (defined(CONFIG_VIDEO_IMX335) || \
+                                     defined(CONFIG_VIDEO_IMX219))
+#  define HAVE_CAMERA 1
 #endif
 
 /* Module supply settling time after enable, with the sensor in reset */
@@ -71,7 +73,7 @@
  * Private Data
  ****************************************************************************/
 
-#ifdef HAVE_IMX335
+#ifdef HAVE_CAMERA
 
 /* IMX335 image processing.  The black level of 12 (8-bit scale) is the dark
  * level measured with the lens covered at the minimum gain and exposure.
@@ -126,7 +128,7 @@ void stm32_camera_power(void)
     }
 }
 
-#ifdef HAVE_IMX335
+#ifdef HAVE_CAMERA
 
 /****************************************************************************
  * Name: stm32_camera_initialize
@@ -135,7 +137,7 @@ void stm32_camera_power(void)
 int stm32_camera_initialize(void)
 {
   FAR struct i2c_master_s *i2c;
-  FAR struct imgsensor_s *sensor;
+  FAR struct imgsensor_s *sensor = NULL;
   int ret;
 
   /* Power the module, then release the sensor reset */
@@ -150,7 +152,17 @@ int stm32_camera_initialize(void)
       return -ENODEV;
     }
 
-  sensor = imx335_initialize(i2c, CAMERA_INCK);
+#ifdef CONFIG_VIDEO_IMX219
+  sensor = imx219_initialize(i2c, CAMERA_INCK);
+#endif
+
+#ifdef CONFIG_VIDEO_IMX335
+  if (sensor == NULL)
+    {
+      sensor = imx335_initialize(i2c, CAMERA_INCK);
+    }
+#endif
+
   if (sensor == NULL)
     {
       return -ENODEV;
