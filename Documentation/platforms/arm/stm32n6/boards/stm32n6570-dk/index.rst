@@ -286,10 +286,11 @@ below it is never written.
 Camera
 ======
 
-The MB1854 module (Sony IMX335, 2592x1944 RAW10) on the camera connector
-is wired to the CSI-2 host (two data lanes) and I2C1 (0x1a).  PD2 enables
-the module and PC8 releases the sensor reset; the module has its own
-24 MHz sensor clock.  The DCMIPP kernel clock is IC17 (300 MHz) and the
+The MB1854 module (Sony IMX335, 2592x1944 or 2/2 binned 1296x972 RAW10,
+including the margins around the recommended image area) on the camera
+connector is wired to the CSI-2 host (two data lanes) and I2C1 (0x1a).  PD2
+enables the module and PC8 releases the sensor reset; the module has its
+own 24 MHz sensor clock.  The DCMIPP kernel clock is IC17 (300 MHz) and the
 D-PHY configuration clock IC18 (20 MHz).  Pipe1 demosaics the frames and
 scales them to RGB565 with the black level measured on the DK and an
 identity colour matrix.  ``CONFIG_STM32_DCMIPP_AE`` adjusts the sensor
@@ -299,7 +300,7 @@ statistics every ``CONFIG_STM32_DCMIPP_ISP_INTERVAL`` frames.  They are
 switched with ``V4L2_CID_EXPOSURE_AUTO`` and
 ``V4L2_CID_AUTO_WHITE_BALANCE``; in manual mode the exposure time and the
 gain are set with ``V4L2_CID_EXPOSURE_ABSOLUTE`` and ``V4L2_CID_GAIN``
-(initially ``CONFIG_VIDEO_IMX335_EXPOSURE`` and
+or ``V4L2_CID_ANALOGUE_GAIN`` (initially ``CONFIG_VIDEO_IMX335_EXPOSURE`` and
 ``CONFIG_VIDEO_IMX335_GAIN``).  The board registers the sensor, the DCMIPP
 in front of it and ``/dev/video``, which reports RGB565; ``camera 0``
 shows a continuous 320x240 preview in the top left corner of the LCD.
