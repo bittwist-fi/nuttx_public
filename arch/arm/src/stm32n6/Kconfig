@@ -140,7 +140,6 @@ menu "DCMIPP Configuration"
 config STM32_DCMIPP_AE
 	bool "Automatic exposure"
 	default y
-	select SCHED_LPWORK
 	---help---
 		Adjust the sensor exposure time, then the gain, from the pipe1
 		statistics towards a target mean luminance.
@@ -157,7 +156,6 @@ config STM32_DCMIPP_AE_TARGET
 config STM32_DCMIPP_AWB
 	bool "Automatic white balance"
 	default y
-	select SCHED_LPWORK
 	---help---
 		Grey world white balance: adjust the red and blue gains of the
 		pipe1 exposure block until the R, G and B means are equal.

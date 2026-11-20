@@ -141,6 +141,9 @@ struct stm32_dcmipp_s
   FAR const struct stm32_dcmipp_config_s *config;
   imgdata_capture_t callback;         /* Frame completion callback */
   FAR void *arg;                      /* Callback argument */
+  struct work_s stopwork;             /* Stop requested in the interrupt */
+  volatile bool stopping;
+  uint8_t stoptype;                   /* Stream type of the deferred stop */
   uintptr_t buf;                      /* Buffer for the next frame or 0 */
   uint32_t framesize;                 /* Bytes in one output frame */
   bool capturing;
@@ -853,6 +856,40 @@ static void dcmipp_disablepipe(void)
 }
 
 /****************************************************************************
+ * Name: dcmipp_stopwork
+ *
+ * Description:
+ *   Finish a stop requested from the frame interrupt.
+ *
+ ****************************************************************************/
+
+static void dcmipp_stopwork(FAR void *arg)
+{
+  FAR struct stm32_dcmipp_s *priv = arg;
+
+  dcmipp_disablepipe();
+  IMGSENSOR_STOP_CAPTURE(priv->sensor, priv->stoptype);
+  priv->stopping = false;
+}
+
+/****************************************************************************
+ * Name: dcmipp_flushstop
+ *
+ * Description:
+ *   Complete a deferred stop that has not run yet.
+ *
+ ****************************************************************************/
+
+static void dcmipp_flushstop(FAR struct stm32_dcmipp_s *priv)
+{
+  work_cancel_sync(LPWORK, &priv->stopwork);
+  if (priv->stopping)
+    {
+      dcmipp_stopwork(priv);
+    }
+}
+
+/****************************************************************************
  * Name: dcmipp_arm
  *
  * Description:
@@ -1238,6 +1275,8 @@ static int dcmipp_uninit(FAR struct imgdata_s *data)
   FAR struct stm32_dcmipp_s *priv = (FAR struct stm32_dcmipp_s *)data;
 
   dcmipp_stop_capture(data);
+  dcmipp_flushstop(priv);
+  dcmipp_disablepipe();
   up_disable_irq(STM32_IRQ_DCMIPP);
   if (priv->csiup)
     {
@@ -1373,12 +1412,9 @@ static int dcmipp_start_capture(FAR struct imgdata_s *data,
       return -EINVAL;
     }
 
-  /* A stop from the frame interrupt leaves the pipe enabled */
+  /* Complete a stop deferred from the frame interrupt */
 
-  if ((getreg32(STM32_DCMIPP_P1FSCR) & DCMIPP_P1FSCR_PIPEN) != 0)
-    {
-      dcmipp_disablepipe();
-    }
+  dcmipp_flushstop(priv);
 
   mode = dcmipp_findmode(priv, fmt->width, fmt->height);
   ret  = dcmipp_getlink(priv, mode, interval, &csi);
@@ -1442,11 +1478,6 @@ static int dcmipp_stop_capture(FAR struct imgdata_s *data)
 
   leave_critical_section(flags);
 
-  /* The capture ends with the current frame.  The capture framework may
-   * stop from the frame interrupt; dcmipp_start_capture() then disables
-   * the pipe.
-   */
-
   if (up_interrupt_context())
     {
 #ifdef HAVE_DCMIPP_AUTO
@@ -1460,7 +1491,6 @@ static int dcmipp_stop_capture(FAR struct imgdata_s *data)
       work_cancel_sync(LPWORK, &priv->work);
       priv->busy = false;
 #endif
-      dcmipp_disablepipe();
     }
 
   return OK;
@@ -1524,6 +1554,7 @@ static int dcmipp_isp_init(FAR struct imgsensor_s *sensor)
 
 static int dcmipp_isp_uninit(FAR struct imgsensor_s *sensor)
 {
+  dcmipp_flushstop(&g_dcmipp);
   return IMGSENSOR_UNINIT(g_dcmipp.sensor);
 }
 
@@ -1595,7 +1626,14 @@ static int dcmipp_isp_start_capture(FAR struct imgsensor_s *sensor,
 static int dcmipp_isp_stop_capture(FAR struct imgsensor_s *sensor,
                                    imgsensor_stream_type_t type)
 {
-  return IMGSENSOR_STOP_CAPTURE(g_dcmipp.sensor, type);
+  FAR struct stm32_dcmipp_s *priv = &g_dcmipp;
+
+  /* May be called from the frame interrupt; the sensor is on I2C */
+
+  priv->stoptype = type;
+  priv->stopping = true;
+  work_queue(LPWORK, &priv->stopwork, dcmipp_stopwork, priv, 0);
+  return OK;
 }
 
 /****************************************************************************
