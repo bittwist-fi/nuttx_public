@@ -90,6 +90,10 @@
 #define DCMIPP_DM_LINEH          0
 #define DCMIPP_DM_EDGE           0
 
+/* Bayer order of a monochrome sensor */
+
+#define DCMIPP_BAYER_MONO        0xff
+
 #if defined(CONFIG_STM32_DCMIPP_AE) || defined(CONFIG_STM32_DCMIPP_AWB)
 #  define HAVE_DCMIPP_AUTO
 #endif
@@ -139,6 +143,7 @@ struct stm32_dcmipp_s
   FAR struct v4l2_frmsizeenum *frmsizes;
   FAR struct imgsensor_s *sensor;     /* Raw sensor */
   FAR const struct stm32_dcmipp_config_s *config;
+  bool mono;                          /* Monochrome sensor */
   imgdata_capture_t callback;         /* Frame completion callback */
   FAR void *arg;                      /* Callback argument */
   struct work_s stopwork;             /* Stop requested in the interrupt */
@@ -1000,7 +1005,10 @@ static int dcmipp_interrupt(int irq, FAR void *context, FAR void *arg)
   if ((status & DCMIPP_CMINT_P1VSYNC) != 0 && priv->capturing)
     {
 #ifdef HAVE_DCMIPP_AUTO
-      dcmipp_stats(priv);
+      if (!priv->mono)
+        {
+          dcmipp_stats(priv);
+        }
 #endif
 
       /* A frame without frame end until the next start is lost */
@@ -1030,7 +1038,8 @@ static int dcmipp_interrupt(int irq, FAR void *context, FAR void *arg)
  * Name: dcmipp_rawfmt
  *
  * Description:
- *   Bayer order and bits per pixel of a raw sensor fourcc.
+ *   Bayer order and bits per pixel of a raw sensor fourcc.  A monochrome
+ *   fourcc has the order DCMIPP_BAYER_MONO.
  *
  ****************************************************************************/
 
@@ -1039,6 +1048,11 @@ static int dcmipp_rawfmt(uint32_t fourcc, FAR uint8_t *bayer,
 {
   switch (fourcc)
     {
+      case V4L2_PIX_FMT_GREY:
+      case V4L2_PIX_FMT_Y10:
+      case V4L2_PIX_FMT_Y12:
+        *bayer = DCMIPP_BAYER_MONO;
+        break;
       case V4L2_PIX_FMT_SRGGB8:
       case V4L2_PIX_FMT_SRGGB10:
       case V4L2_PIX_FMT_SRGGB12:
@@ -1073,6 +1087,7 @@ static int dcmipp_rawfmt(uint32_t fourcc, FAR uint8_t *bayer,
       case V4L2_PIX_FMT_SGRBG8:
       case V4L2_PIX_FMT_SGBRG8:
       case V4L2_PIX_FMT_SBGGR8:
+      case V4L2_PIX_FMT_GREY:
         *bpp = 8;
         break;
 
@@ -1080,6 +1095,7 @@ static int dcmipp_rawfmt(uint32_t fourcc, FAR uint8_t *bayer,
       case V4L2_PIX_FMT_SGRBG10:
       case V4L2_PIX_FMT_SGBRG10:
       case V4L2_PIX_FMT_SBGGR10:
+      case V4L2_PIX_FMT_Y10:
         *bpp = 10;
         break;
 
@@ -1131,6 +1147,32 @@ dcmipp_findmode(FAR struct stm32_dcmipp_s *priv, uint32_t width,
 }
 
 /****************************************************************************
+ * Name: dcmipp_configgrey
+ *
+ * Description:
+ *   Program the pipe1 image processing for a monochrome sensor: no black
+ *   level and no demosaicing.  The pixel is on the green (Y) lane and the
+ *   colour matrix copies it to red and blue, which gives grey RGB.
+ *
+ ****************************************************************************/
+
+static void dcmipp_configgrey(FAR const struct stm32_dcmipp_config_s *cfg)
+{
+  putreg32(0, STM32_DCMIPP_P1BLCCR);
+  putreg32(0, STM32_DCMIPP_P1DMCR);
+
+  putreg32(dcmipp_coef(0, 256), STM32_DCMIPP_P1CCRR1);
+  putreg32(dcmipp_coef(0, 0), STM32_DCMIPP_P1CCRR2);
+  putreg32(dcmipp_coef(0, 256), STM32_DCMIPP_P1CCGR1);
+  putreg32(dcmipp_coef(0, 0), STM32_DCMIPP_P1CCGR2);
+  putreg32(dcmipp_coef(0, 256), STM32_DCMIPP_P1CCBR1);
+  putreg32(dcmipp_coef(0, 0), STM32_DCMIPP_P1CCBR2);
+  putreg32(DCMIPP_P1CCCR_ENABLE, STM32_DCMIPP_P1CCCR);
+
+  putreg32(cfg->gamma ? DCMIPP_P1GMCR_ENABLE : 0, STM32_DCMIPP_P1GMCR);
+}
+
+/****************************************************************************
  * Name: dcmipp_configlink
  *
  * Description:
@@ -1158,11 +1200,18 @@ static int dcmipp_configlink(FAR struct stm32_dcmipp_s *priv,
            DCMIPP_P1FSCR_DTMODE_DTIDA | DCMIPP_P1FSCR_VC(0),
            STM32_DCMIPP_P1FSCR);
 
-  dcmipp_configisp(priv->config, bayer);
+  if (bayer == DCMIPP_BAYER_MONO)
+    {
+      dcmipp_configgrey(priv->config);
+    }
+  else
+    {
+      dcmipp_configisp(priv->config, bayer);
 
 #ifdef HAVE_DCMIPP_AUTO
-  dcmipp_configstats(priv, mode->width, mode->height);
+      dcmipp_configstats(priv, mode->width, mode->height);
 #endif
+    }
 
   /* Start the D-PHY and virtual channel 0 of the CSI-2 host */
 
@@ -1435,7 +1484,10 @@ static int dcmipp_start_capture(FAR struct imgdata_s *data,
   putreg32(fmt->width * 2, STM32_DCMIPP_P1PPM0PR);
 
 #ifdef HAVE_DCMIPP_AUTO
-  dcmipp_autostart(priv);
+  if (!priv->mono)
+    {
+      dcmipp_autostart(priv);
+    }
 #endif
 
   flags = enter_critical_section();
@@ -1821,6 +1873,8 @@ int stm32_dcmipp_initialize(FAR const struct stm32_dcmipp_config_s *config,
           continue;
         }
 
+      priv->mono = bayer == DCMIPP_BAYER_MONO;
+
       priv->ispmodes[nmodes].pixelformat = V4L2_PIX_FMT_RGB565;
       priv->ispmodes[nmodes].width       = raw->width;
       priv->ispmodes[nmodes].height      = raw->height;
@@ -1849,6 +1903,15 @@ int stm32_dcmipp_initialize(FAR const struct stm32_dcmipp_config_s *config,
       ret = -ENOTSUP;
       goto errout;
     }
+
+  /* The automatic exposure and white balance need a colour sensor */
+
+#ifdef CONFIG_STM32_DCMIPP_AE
+  priv->aeauto = !priv->mono;
+#endif
+#ifdef CONFIG_STM32_DCMIPP_AWB
+  priv->awbauto = !priv->mono;
+#endif
 
   for (i = 0; i < nsizes; i++)
     {
