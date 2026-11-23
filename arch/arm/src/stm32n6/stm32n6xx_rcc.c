@@ -472,6 +472,7 @@ static inline void rcc_enableapb1(void)
   if (regval != 0)
     {
       putreg32(regval, STM32_RCC_APB1LENSR);
+      putreg32(regval, STM32_RCC_APB1LLPENSR);
     }
 }
 
@@ -536,6 +537,7 @@ static inline void rcc_enableapb4(void)
   if (regval != 0)
     {
       putreg32(regval, STM32_RCC_APB4LENSR);
+      putreg32(regval, STM32_RCC_APB4LLPENSR);
     }
 }
 
@@ -991,8 +993,8 @@ void stm32_rcc_enableperipherals(void)
    * IMPRECISERR bus fault.
    */
 
-  putreg32(RCC_MEMENR_ALLAXISRAM | RCC_MEMENR_CACHEAXIRAMEN,
-           STM32_RCC_MEMENSR);
+  putreg32(RCC_MEMENR_ALLAXISRAM | RCC_MEMENR_CACHEAXIRAMEN |
+           RCC_MEMENR_FLEXRAMEN, STM32_RCC_MEMENSR);
 
   /* AXISRAM3-6 also come out of reset shut down in RAMCFG: they read as
    * zero and ignore writes until SRAMSD is cleared.
@@ -1175,8 +1177,8 @@ void stm32_stdclockconfig(void)
    * STM32N6; re-arm them so the heap stays alive.
    */
 
-  putreg32(RCC_MEMENR_ALLAXISRAM | RCC_MEMENR_CACHEAXIRAMEN,
-           STM32_RCC_MEMENSR);
+  putreg32(RCC_MEMENR_ALLAXISRAM | RCC_MEMENR_CACHEAXIRAMEN |
+           RCC_MEMENR_FLEXRAMEN, STM32_RCC_MEMENSR);
 
   rcc_waitfield(STM32_RCC_CFGR1, RCC_CFGR1_SWS_MASK,
                 RCC_CFGR1_SW2SWS(STM32_RCC_CFGR1_CPUSW |
