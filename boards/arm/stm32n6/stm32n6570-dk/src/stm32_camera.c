@@ -47,7 +47,9 @@
  ****************************************************************************/
 
 #if defined(CONFIG_STM32_DCMIPP) && (defined(CONFIG_VIDEO_IMX335) || \
-                                     defined(CONFIG_VIDEO_IMX219))
+                                     defined(CONFIG_VIDEO_IMX219) || \
+                                     defined(CONFIG_VIDEO_OV7251) || \
+                                     defined(CONFIG_VIDEO_OV9281))
 #  define HAVE_CAMERA 1
 #endif
 
@@ -160,6 +162,20 @@ int stm32_camera_initialize(void)
   if (sensor == NULL)
     {
       sensor = imx335_initialize(i2c, CAMERA_INCK);
+    }
+#endif
+
+#ifdef CONFIG_VIDEO_OV7251
+  if (sensor == NULL)
+    {
+      sensor = ov7251_initialize(i2c, CAMERA_INCK);
+    }
+#endif
+
+#ifdef CONFIG_VIDEO_OV9281
+  if (sensor == NULL)
+    {
+      sensor = ov9281_initialize(i2c, CAMERA_INCK);
     }
 #endif
 
